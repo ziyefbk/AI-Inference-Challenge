@@ -3,7 +3,7 @@ set -e
 
 cd "$(dirname "$0")"
 
-# Find available Python 3.x
+# 查找可用的 Python 3.x
 for py in python3.12 python3.11 python3 python; do
     if command -v $py &> /dev/null; then
         PYTHON_BIN=$py
@@ -12,13 +12,13 @@ for py in python3.12 python3.11 python3 python; do
 done
 
 if [ -z "$PYTHON_BIN" ]; then
-    echo "No Python found"
+    echo "未找到 Python"
     exit 1
 fi
 
 source /tmp/contestant_env/bin/activate
 
-# Load env defaults from config if available
+# 从配置加载环境变量默认值
 MODEL_PATH=${MODEL_PATH:-"/mnt/model/Qwen3-32B"}
 CONTESTANT_PORT=${CONTESTANT_PORT:-9000}
 PLATFORM_URL=${PLATFORM_URL:-"http://10.0.0.1:8003"}
@@ -31,5 +31,5 @@ export PLATFORM_URL
 export CONTESTANT_TOKEN
 export CONTESTANT_NAME
 
-# Start the full service via main.py
+# 通过 main.py 启动完整服务
 exec $PYTHON_BIN main.py

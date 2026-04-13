@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Find available Python 3.x
+# 查找可用的 Python 3.x
 for py in python3.12 python3 python; do
     if command -v $py &> /dev/null; then
         PYTHON_BIN=$py
@@ -10,14 +10,14 @@ for py in python3.12 python3 python; do
 done
 
 if [ -z "$PYTHON_BIN" ]; then
-    echo "No Python found, please install Python 3.12"
+    echo "未找到 Python,请安装 Python 3.12"
     exit 1
 fi
 
-echo "Using Python: $PYTHON_BIN"
+echo "使用 Python: $PYTHON_BIN"
 $PYTHON_BIN --version
 
-# Create venv if needed
+# 如需要则创建虚拟环境
 if [ ! -d /tmp/contestant_env ]; then
     $PYTHON_BIN -m venv /tmp/contestant_env
 fi
