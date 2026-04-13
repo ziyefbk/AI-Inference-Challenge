@@ -18,13 +18,20 @@ import json
 import time
 import logging
 import asyncio
+import random
 from typing import Optional, Dict, Any, List
 from functools import lru_cache
 import tiktoken
 
+
+@lru_cache(maxsize=4)
+def _get_tiktoken_encoding(encoding_name: str = "cl100k_base"):
+    """获取 tiktoken 编码器,带缓存避免重复创建。"""
+    return tiktoken.get_encoding(encoding_name)
+
 # 导入工具模块
-from .utils.metrics import metrics as _metrics_collector
-from .utils.logger import setup_logger, get_logger
+from src.utils.metrics import metrics as _metrics_collector
+from src.utils.logger import setup_logger, get_logger
 
 # 初始化日志
 setup_logger(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -167,6 +174,7 @@ async def _call_vllm_async(
             last_error = e
             if attempt < max_retries:
                 wait_time = min(backoff_factor ** attempt, RETRY_CONFIG["max_backoff"])
+                wait_time *= (0.5 + random.random())  # 添加 jitter
                 await asyncio.sleep(wait_time)
                 continue
             raise last_error
@@ -382,7 +390,7 @@ def load_config():
         if "sla_levels" in config:
             SLA_LEVELS = config["sla_levels"]
     except Exception as e:
-        print(f"[Inference] 配置文件加载失败: {e}")
+        logger.warning("config_load_failed", error=str(e))
 
 
 load_config()
@@ -467,61 +475,34 @@ def compute_logprob(
         return 0.0
 
     full_text = prompt + continuation
-
-    # 根据 SLA 策略确定 logprobs 数量
-    logprobs_request = 100  # 默认值
+    logprobs_request = 100
     if sla_strategy is not None:
         logprobs_request = sla_strategy.get("logprobs_requested", 100)
 
+    # 尝试获取精确的 token 数
+    prompt_tokens = 0
+    continuation_tokens = 0
     try:
-        enc = tiktoken.get_encoding("cl100k_base")
+        enc = _get_tiktoken_encoding()
         prompt_tokens = len(enc.encode(prompt))
         continuation_tokens = len(enc.encode(continuation))
+        logprobs_request = prompt_tokens + continuation_tokens
     except Exception:
-        # 降级方案: tiktoken 失败时使用启发式方法
-        try:
-            response = _call_vllm(
-                prompt=full_text,
-                max_tokens=1,
-                logprobs=logprobs_request,
-                echo=True,
-                temperature=0.0,
-                top_p=1.0,
-                top_k=1,
-            )
-        except Exception as e:
-            print(f"[Inference] vLLM 调用失败 (logprob): {e}")
-            return -10.0
-
-        choices = response.get("choices", [])
-        if not choices:
-            return -10.0
-
-        logprobs_data = choices[0].get("logprobs", {})
-        token_logprobs = logprobs_data.get("token_logprobs", [])
-        if not token_logprobs or len(token_logprobs) < 2:
-            return -10.0
-
-        n = len(token_logprobs)
-        start_idx = n // 2
-        cont_logprobs = token_logprobs[start_idx:]
-        cont_logprobs = [lp for lp in cont_logprobs if lp is not None]
-        if not cont_logprobs:
-            return -10.0
-        return float(sum(cont_logprobs))
+        # tiktoken 失败时，使用较大值确保覆盖
+        logprobs_request = 200
 
     try:
         response = _call_vllm(
             prompt=full_text,
             max_tokens=1,
-            logprobs=prompt_tokens + continuation_tokens,
+            logprobs=logprobs_request,
             echo=True,
             temperature=0.0,
             top_p=1.0,
             top_k=1,
         )
     except Exception as e:
-        print(f"[Inference] vLLM 调用失败 (logprob): {e}")
+        logger.error(f"[Inference] vLLM 调用失败 (logprob): {e}")
         return -10.0
 
     choices = response.get("choices", [])
@@ -530,23 +511,25 @@ def compute_logprob(
 
     logprobs_data = choices[0].get("logprobs", {})
     token_logprobs = logprobs_data.get("token_logprobs", [])
-
     if not token_logprobs or len(token_logprobs) < 2:
         return -10.0
 
-    # 前 prompt_tokens 个条目对应 prompt,
-    # 后续条目对应 continuation
-    start_idx = prompt_tokens
-    end_idx = prompt_tokens + continuation_tokens
-    cont_logprobs = token_logprobs[start_idx:end_idx]
+    # 如果有精确 token 数，使用精确边界；否则用中间点
+    if prompt_tokens > 0 and continuation_tokens > 0:
+        start_idx = prompt_tokens
+        end_idx = prompt_tokens + continuation_tokens
+        cont_logprobs = token_logprobs[start_idx:end_idx]
+    else:
+        # 启发式：后半部分为 continuation
+        n = len(token_logprobs)
+        start_idx = n // 2
+        cont_logprobs = token_logprobs[start_idx:]
 
-    # 过滤掉 None 值
     cont_logprobs = [lp for lp in cont_logprobs if lp is not None]
     if not cont_logprobs:
         return -10.0
 
-    total_logprob = sum(cont_logprobs)
-    return float(total_logprob)
+    return float(sum(cont_logprobs))
 
 
 def compute_rolling_logprob(
@@ -570,7 +553,7 @@ def compute_rolling_logprob(
         )
 
     try:
-        enc = tiktoken.get_encoding("cl100k_base")
+        enc = _get_tiktoken_encoding()
         num_tokens = len(enc.encode(text))
         # 请求足够的 logprobs 以覆盖所有 token
         logprobs_request = max(logprobs_request, min(num_tokens + 10, 2000))
@@ -588,7 +571,7 @@ def compute_rolling_logprob(
             top_k=1,
         )
     except Exception as e:
-        print(f"[Inference] vLLM 调用失败 (rolling logprob): {e}")
+        logger.error(f"[Inference] vLLM 调用失败 (rolling logprob): {e}")
         return -10.0
 
     choices = response.get("choices", [])
@@ -607,6 +590,157 @@ def compute_rolling_logprob(
         return -10.0
 
     return float(sum(valid_logprobs))
+
+
+async def generate_text_async(
+    prompt: str,
+    gen_kwargs: Optional[Dict[str, Any]] = None,
+    sla_strategy: Optional[Dict[str, Any]] = None,
+) -> str:
+    """异步文本生成。"""
+    if gen_kwargs is None:
+        gen_kwargs = {}
+
+    if sla_strategy is not None:
+        max_tokens = gen_kwargs.get("max_gen_toks", sla_strategy.get("max_gen_toks", 256))
+        temperature = gen_kwargs.get("temperature", sla_strategy.get("temperature", 0.0))
+        top_p = gen_kwargs.get("top_p", sla_strategy.get("top_p", 1.0))
+        top_k = gen_kwargs.get("top_k", sla_strategy.get("top_k", 50))
+        until = gen_kwargs.get("until", ["\n\n"])
+        repetition_penalty = gen_kwargs.get("repetition_penalty", sla_strategy.get("repetition_penalty", 1.0))
+        frequency_penalty = gen_kwargs.get("frequency_penalty", sla_strategy.get("frequency_penalty", 0.0))
+        presence_penalty = gen_kwargs.get("presence_penalty", sla_strategy.get("presence_penalty", 0.0))
+        max_model_len = sla_strategy.get("max_model_len")
+        beam_size = sla_strategy.get("beam_size", 1)
+        best_of = sla_strategy.get("n", 1)
+    else:
+        max_tokens = gen_kwargs.get("max_gen_toks", 256)
+        temperature = gen_kwargs.get("temperature", 0.0)
+        top_p = gen_kwargs.get("top_p", 1.0)
+        top_k = gen_kwargs.get("top_k", 50)
+        until = gen_kwargs.get("until", ["\n\n"])
+        repetition_penalty = gen_kwargs.get("repetition_penalty", 1.0)
+        frequency_penalty = gen_kwargs.get("frequency_penalty", 0.0)
+        presence_penalty = gen_kwargs.get("presence_penalty", 0.0)
+        max_model_len = None
+        beam_size = 1
+        best_of = 1
+
+    try:
+        response = await _call_vllm_async(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            stop=until,
+            repetition_penalty=repetition_penalty,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            max_model_len=max_model_len,
+            beam_size=beam_size,
+            best_of=best_of,
+        )
+    except Exception as e:
+        logger.error(f"[Inference] 异步文本生成失败: {e}")
+        return ""
+
+    choices = response.get("choices", [])
+    if not choices:
+        return ""
+
+    text = choices[0].get("text", "")
+    text = _apply_stop_strings(text, until)
+    return text
+
+
+async def compute_logprob_async(
+    prompt: str,
+    continuation: str,
+    sla_strategy: Optional[Dict[str, Any]] = None,
+) -> float:
+    """异步计算 log P(continuation | prompt)，优化为单次 API 调用。"""
+    if not continuation:
+        return 0.0
+
+    full_text = prompt + continuation
+    logprobs_request = 100
+    if sla_strategy is not None:
+        logprobs_request = sla_strategy.get("logprobs_requested", 100)
+
+    prompt_tokens = 0
+    continuation_tokens = 0
+    try:
+        enc = _get_tiktoken_encoding()
+        prompt_tokens = len(enc.encode(prompt))
+        continuation_tokens = len(enc.encode(continuation))
+        logprobs_request = prompt_tokens + continuation_tokens
+    except Exception:
+        logprobs_request = 200
+
+    try:
+        response = await _call_vllm_async(
+            prompt=full_text, max_tokens=1, logprobs=logprobs_request,
+            echo=True, temperature=0.0, top_p=1.0, top_k=1,
+        )
+    except Exception as e:
+        logger.error(f"[Inference] 异步 logprob 调用失败: {e}")
+        return -10.0
+
+    choices = response.get("choices", [])
+    if not choices:
+        return -10.0
+    logprobs_data = choices[0].get("logprobs", {})
+    token_logprobs = logprobs_data.get("token_logprobs", [])
+    if not token_logprobs or len(token_logprobs) < 2:
+        return -10.0
+
+    if prompt_tokens > 0 and continuation_tokens > 0:
+        start_idx = prompt_tokens
+        cont_logprobs = [lp for lp in token_logprobs[start_idx:start_idx + continuation_tokens] if lp is not None]
+    else:
+        n = len(token_logprobs)
+        cont_logprobs = [lp for lp in token_logprobs[n // 2:] if lp is not None]
+    return float(sum(cont_logprobs)) if cont_logprobs else -10.0
+
+
+async def compute_rolling_logprob_async(
+    text: str,
+    sla_strategy: Optional[Dict[str, Any]] = None,
+) -> float:
+    """异步计算整个文本的滚动 log-likelihood。"""
+    if not text:
+        return 0.0
+
+    logprobs_request = 1000
+    if sla_strategy is not None:
+        logprobs_request = min(sla_strategy.get("logprobs_requested", 1000) * 10, 2000)
+
+    try:
+        enc = _get_tiktoken_encoding()
+        num_tokens = len(enc.encode(text))
+        logprobs_request = max(logprobs_request, min(num_tokens + 10, 2000))
+    except Exception:
+        pass
+
+    try:
+        response = await _call_vllm_async(
+            prompt=text, max_tokens=1, logprobs=logprobs_request,
+            echo=True, temperature=0.0, top_p=1.0, top_k=1,
+        )
+    except Exception as e:
+        logger.error(f"[Inference] 异步 rolling logprob 调用失败: {e}")
+        return -10.0
+
+    choices = response.get("choices", [])
+    if not choices:
+        return -10.0
+    logprobs_data = choices[0].get("logprobs", {})
+    token_logprobs = logprobs_data.get("token_logprobs", [])
+    if not token_logprobs or len(token_logprobs) < 2:
+        return -10.0
+    valid_logprobs = [lp for lp in token_logprobs[1:] if lp is not None]
+    return float(sum(valid_logprobs) / len(valid_logprobs)) if valid_logprobs else -10.0
 
 
 def generate_text(
@@ -671,7 +805,7 @@ def generate_text(
             best_of=best_of,
         )
     except Exception as e:
-        print(f"[Inference] 文本生成失败: {e}")
+        logger.error(f"[Inference] 文本生成失败: {e}")
         return ""
 
     choices = response.get("choices", [])
@@ -853,20 +987,20 @@ async def _process_single_message(
     try:
         if rt == "generate_until":
             gen_kwargs = msg.get("eval_gen_kwargs", {})
-            response_text = generate_text(prompt, gen_kwargs, sla_strategy)
+            response_text = await generate_text_async(prompt, gen_kwargs, sla_strategy)
             result["response"] = response_text
             result["accuracy"] = None
             tokens = len(response_text.split()) if response_text else 0
 
         elif rt == "loglikelihood":
             continuation = msg.get("eval_continuation", "")
-            logprob = compute_logprob(prompt, continuation, sla_strategy)
+            logprob = await compute_logprob_async(prompt, continuation, sla_strategy)
             result["accuracy"] = logprob
             result["response"] = None
             tokens = len(continuation.split()) if continuation else 0
 
         elif rt == "loglikelihood_rolling":
-            logprob = compute_rolling_logprob(prompt, sla_strategy)
+            logprob = await compute_rolling_logprob_async(prompt, sla_strategy)
             result["accuracy"] = logprob
             result["response"] = None
             tokens = len(prompt.split())
@@ -907,9 +1041,9 @@ async def _process_single_message(
 # 快速测试
 if __name__ == "__main__":
     # 测试基本生成功能
-    print("[Inference] 测试基本文本生成...")
+        logger.info("[Inference] 测试基本文本生成...")
     try:
         result = generate_text("Hello, how are you?", {"max_gen_toks": 20})
-        print(f"[Inference] 生成结果: {result[:100]}")
+        logger.info(f"[Inference] 生成结果: {result[:100]}")
     except Exception as e:
-        print(f"[Inference] 测试失败 (vLLM 未运行属正常): {e}")
+        logger.warning(f"[Inference] 测试失败 (vLLM 未运行属正常): {e}")

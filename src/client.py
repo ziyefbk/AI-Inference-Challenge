@@ -25,12 +25,12 @@ from collections import deque
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # 导入工具模块
-from .utils.circuit import CircuitBreaker, CircuitBreakerOpen
-from .utils.metrics import metrics
-from .utils.logger import setup_logger, get_logger
-from .utils.graceful import shutdown_manager
+from src.utils.circuit import CircuitBreaker, CircuitBreakerOpen
+from src.utils.metrics import metrics
+from src.utils.logger import setup_logger, get_logger
+from src.utils.graceful import shutdown_manager
 
-from inference import run_inference
+from src.inference import run_inference
 
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://10.0.0.1:8003")
@@ -247,6 +247,150 @@ class TaskHolder:
             }
 
 
+import heapq
+
+
+class PriorityTaskHolder:
+    """
+    基于 heapq 优先队列的任务持有器。
+    支持多维度优先级排序，比 TaskHolder 更高效。
+    """
+
+    def __init__(self, max_held: int = MAX_HELD_TASKS, timeout_s: int = TASK_ACCEPT_TIMEOUT):
+        self.max_held = max_held
+        self.timeout_s = timeout_s
+        self._heap: List[tuple] = []  # (priority, counter, accept_time, task)
+        self._task_map: Dict[int, tuple] = {}  # task_id -> (priority, task, accept_time)
+        self._lock = asyncio.Lock()
+        self._counter = 0  # 用于相同优先级的稳定排序
+
+    def _compute_priority(self, task: Dict[str, Any], accept_time: float) -> float:
+        """
+        计算任务优先级分数。
+        分数越小越优先: 剩余时间越少越紧急。
+        """
+        overview = task.get("overview", {})
+        if not isinstance(overview, dict):
+            return float("inf")
+
+        deadline_ms = overview.get("deadline_ms", float("inf"))
+        msg_count = len(task.get("messages", []))
+        reward = overview.get("target_reward", 1.0)
+        sla = overview.get("target_sla", "standard")
+
+        now = time.monotonic()
+        remaining = deadline_ms / 1000.0 - now  # 剩余秒数
+
+        # 紧迫度权重: 越接近截止时间越优先
+        urgency_weight = 1.0
+        # 复杂度惩罚: 消息越多估计耗时越长
+        complexity_penalty = msg_count * 0.5
+        # 奖励调整: 高奖励任务略微优先
+        reward_bonus = (reward - 1.0) * 5.0
+
+        # SLA 等级调整
+        sla_adjustment = {"express": -10, "fast": -5, "standard": 0, "high_quality": 5}.get(sla, 0)
+
+        return remaining * urgency_weight + complexity_penalty - reward_bonus + sla_adjustment
+
+    async def add_task(self, task: Dict[str, Any]) -> bool:
+        """添加任务,超容返回 False。"""
+        async with self._lock:
+            if len(self._heap) >= self.max_held:
+                return False
+
+            accept_time = time.monotonic()
+            priority = self._compute_priority(task, accept_time)
+            self._counter += 1
+            task_id = task.get("overview", {}).get("task_id", self._counter)
+
+            heapq.heappush(self._heap, (priority, self._counter, accept_time, task))
+            self._task_map[task_id] = (priority, task, accept_time)
+            return True
+
+    async def get_task(self) -> Optional[tuple]:
+        """获取最优先的任务(不移除)。"""
+        async with self._lock:
+            if not self._heap:
+                return None
+            _, _, accept_time, task = self._heap[0]
+            return (task, accept_time)
+
+    async def pop_task(self) -> Optional[tuple]:
+        """取出并移除最优先的任务，自动跳过已标记完成的任务。"""
+        async with self._lock:
+            while self._heap:
+                priority, counter, accept_time, task = heapq.heappop(self._heap)
+                task_id = task.get("overview", {}).get("task_id", counter)
+                if task_id in self._task_map:
+                    # 从 map 中移除并返回
+                    self._task_map.pop(task_id, None)
+                    return (task, accept_time)
+                # 无效条目，跳过继续弹出
+            return None
+
+    async def mark_done(self, task_id: int) -> bool:
+        """标记任务完成。"""
+        async with self._lock:
+            if task_id in self._task_map:
+                del self._task_map[task_id]
+                # 注意: heap 中不会物理删除,下次 pop 时会跳过
+                return True
+            return False
+
+    async def cleanup_done(self):
+        """清理已完成的无效条目。"""
+        async with self._lock:
+            self._heap = [(p, c, at, t) for p, c, at, t in self._heap
+                         if t.get("overview", {}).get("task_id") in self._task_map]
+            heapq.heapify(self._heap)
+
+    async def get_expired(self) -> List[tuple]:
+        """获取已超时的任务。"""
+        now = time.monotonic()
+        expired = []
+        valid = []
+
+        async with self._lock:
+            for priority, counter, accept_time, task in self._heap:
+                if now - accept_time > self.timeout_s:
+                    expired.append((task, accept_time))
+                    task_id = task.get("overview", {}).get("task_id", counter)
+                    self._task_map.pop(task_id, None)
+                else:
+                    valid.append((priority, counter, accept_time, task))
+
+            self._heap = valid
+            heapq.heapify(self._heap)
+
+        return expired
+
+    async def size(self) -> int:
+        """获取当前持有任务数。"""
+        async with self._lock:
+            return len(self._heap)
+
+    async def has_capacity(self) -> bool:
+        """检查是否还有容量。"""
+        async with self._lock:
+            return len(self._heap) < self.max_held
+
+    async def get_stats(self) -> Dict[str, Any]:
+        """获取统计。"""
+        async with self._lock:
+            now = time.monotonic()
+            expired_count = sum(
+                1 for _, _, accept_time, _ in self._heap
+                if now - accept_time > self.timeout_s
+            )
+            return {
+                "held": len(self._heap),
+                "max": self.max_held,
+                "expired": expired_count,
+                "capacity": self.max_held - len(self._heap),
+            }
+
+
 # ── 熔断器组 ─────────────────────────────────────────────────────────────
 
 # 为不同 API 维护独立的熔断器
@@ -409,7 +553,8 @@ async def accept_task(client: httpx.AsyncClient, task_id: int, target_sla: str, 
                     delay = backoff.record_failure()
                 logger.warning("ask_server_error", status=resp.status_code, attempt=attempt+1)
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(delay if backoff else 1 * (attempt + 1))
+                    jitter = random.uniform(0.5, 1.5)
+                    await asyncio.sleep((delay if backoff else 1 * (attempt + 1)) * jitter)
                 continue
             else:
                 _ask_breaker.record_failure_sync()
@@ -417,11 +562,13 @@ async def accept_task(client: httpx.AsyncClient, task_id: int, target_sla: str, 
         except httpx.TimeoutException:
             logger.warning("ask_timeout", task_id=task_id, attempt=attempt+1)
             if attempt < max_retries - 1:
-                await asyncio.sleep(1 * (attempt + 1))
+                jitter = random.uniform(0.5, 1.5)
+                await asyncio.sleep(1 * (attempt + 1) * jitter)
         except Exception as e:
             logger.exception("ask_error", task_id=task_id, attempt=attempt+1, error=str(e))
             if attempt < max_retries - 1:
-                await asyncio.sleep(1 * (attempt + 1))
+                jitter = random.uniform(0.5, 1.5)
+                await asyncio.sleep(1 * (attempt + 1) * jitter)
 
     return None
 
@@ -458,7 +605,8 @@ async def submit_results(client: httpx.AsyncClient, task_data: Dict[str, Any], b
                     delay = backoff.record_failure()
                 logger.warning("submit_error", status=resp.status_code, attempt=attempt+1)
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(delay if backoff else 2 * (attempt + 1))
+                    jitter = random.uniform(0.5, 1.5)
+                    await asyncio.sleep((delay if backoff else 2 * (attempt + 1)) * jitter)
                 continue
             else:
                 _submit_breaker.record_failure_sync()
@@ -469,12 +617,14 @@ async def submit_results(client: httpx.AsyncClient, task_data: Dict[str, Any], b
             _submit_breaker.record_failure_sync()
             logger.warning("submit_timeout", attempt=attempt+1)
             if attempt < max_retries - 1:
-                await asyncio.sleep(2 * (attempt + 1))
+                jitter = random.uniform(0.5, 1.5)
+                await asyncio.sleep(2 * (attempt + 1) * jitter)
         except Exception as e:
             _submit_breaker.record_failure_sync()
             logger.exception("submit_error", attempt=attempt+1, error=str(e))
             if attempt < max_retries - 1:
-                await asyncio.sleep(2 * (attempt + 1))
+                jitter = random.uniform(0.5, 1.5)
+                await asyncio.sleep(2 * (attempt + 1) * jitter)
 
     metrics.inc_counter("client.submit.exhausted_retries")
     return False
@@ -549,7 +699,11 @@ async def main_loop():
 
     backoff = BackoffState()
     rate_limiter = RateLimiter(max_rate=MAX_QUERY_RATE, burst=MAX_QUERY_RATE)
-    task_holder = TaskHolder(max_held=MAX_HELD_TASKS, timeout_s=TASK_ACCEPT_TIMEOUT)
+    task_holder = PriorityTaskHolder(max_held=MAX_HELD_TASKS, timeout_s=TASK_ACCEPT_TIMEOUT)
+
+    # Worker 数量配置
+    NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "3"))
+    PREFETCH_SIZE = int(os.environ.get("PREFETCH_SIZE", "8"))
 
     async with httpx.AsyncClient(timeout=60, limits=CLIENT_LIMITS) as client:
         # 注册
@@ -557,29 +711,30 @@ async def main_loop():
             logger.error("registration_failed")
             return
 
-        # 创建并发推理 worker
-        async def inference_worker():
+        async def inference_worker(worker_id: int):
             """从持有器中处理任务的 worker。"""
             last_checkpoint = time.time()
 
             while True:
                 # 检查优雅关闭
                 if shutdown_manager.is_shutting_down:
-                    logger.info("worker_stopping", reason="shutdown")
+                    logger.info("worker_stopping", worker_id=worker_id, reason="shutdown")
                     break
 
-                # 检查超时任务
-                expired = await task_holder.get_expired()
-                for task, _ in expired:
-                    task_id = task.get("overview", {}).get("task_id")
-                    logger.warning("task_expired", task_id=task_id)
-                    stats["tasks_expired"] += 1
-                    metrics.inc_counter("client.tasks.expired")
-                    await task_holder.mark_done(task_id)
-
                 # 获取下一个任务
-                item = await task_holder.get_task()
+                item = await task_holder.pop_task()
                 if item is None:
+                    # 只有在空闲时才检查过期任务，减少堆遍历开销
+                    _check_counter = getattr(task_holder, '_check_counter', 0) + 1
+                    task_holder._check_counter = _check_counter
+                    if _check_counter >= 5:  # 每 5 次空闲检查一次过期
+                        expired = await task_holder.get_expired()
+                        for task, _ in expired:
+                            task_id = task.get("overview", {}).get("task_id")
+                            logger.warning("task_expired", task_id=task_id)
+                            stats["tasks_expired"] += 1
+                            metrics.inc_counter("client.tasks.expired")
+                        task_holder._check_counter = 0
                     await asyncio.sleep(0.05)
                     continue
 
@@ -594,8 +749,6 @@ async def main_loop():
                     remaining = deadline_ms / 1000.0
                     if remaining < 1:
                         logger.warning("task_about_to_expire", task_id=task_id)
-                        await task_holder.pop_task()
-                        await task_holder.mark_done(task_id)
                         stats["tasks_expired"] += 1
                         continue
 
@@ -603,16 +756,13 @@ async def main_loop():
                 success = await process_task(client, task, backoff, sla_level)
                 elapsed = time.monotonic() - start_time
 
-                # 标记完成
-                await task_holder.mark_done(task_id)
-
                 async with asyncio.Lock():
                     if success:
                         stats["tasks_completed"] += 1
                         stats["total_inference_time"] += elapsed
                         metrics.inc_counter("client.tasks.completed")
                         metrics.observe_histogram("client.inference_time", elapsed)
-                        logger.info("task_completed", task_id=task_id, elapsed=elapsed)
+                        logger.info("task_completed", task_id=task_id, elapsed=elapsed, worker_id=worker_id)
                     else:
                         stats["tasks_failed"] += 1
                         metrics.inc_counter("client.tasks.failed")
@@ -626,7 +776,7 @@ async def main_loop():
 
                 # 定期打印统计
                 completed = stats["tasks_completed"] + stats["tasks_failed"] + stats["tasks_expired"]
-                if completed % 10 == 0:
+                if completed % 10 == 0 and worker_id == 0:
                     avg_time = stats["total_inference_time"] / max(stats["tasks_completed"], 1)
                     holder_stats = await task_holder.get_stats()
                     circuit_breakers = get_circuit_breakers()
@@ -643,10 +793,54 @@ async def main_loop():
                         }
                     )
 
-        # 启动 worker
-        worker_task = asyncio.create_task(inference_worker())
+        # 启动多个 worker
+        workers = [asyncio.create_task(inference_worker(i)) for i in range(NUM_WORKERS)]
+        logger.info("workers_started", num_workers=NUM_WORKERS)
 
-        # 主循环 - 获取并持有任务
+        # 主循环 - 获取并持有任务,带预取
+        async def prefetch_tasks():
+            """预取任务到持有器，自适应调整预取数量。"""
+            holder_stats = await task_holder.get_stats()
+            fill_ratio = holder_stats["held"] / max(holder_stats["max"], 1)
+
+            # 根据填充率动态调整预取数量
+            if fill_ratio < 0.5:
+                dynamic_size = PREFETCH_SIZE * 2  # 空时多预取
+            elif fill_ratio > 0.8:
+                dynamic_size = 1  # 满时少预取
+            else:
+                dynamic_size = PREFETCH_SIZE
+
+            prefetched = 0
+            for _ in range(dynamic_size):
+                if not await task_holder.has_capacity():
+                    break
+                if shutdown_manager.is_shutting_down:
+                    break
+
+                task_overview = await query_task(client, backoff)
+                stats["queries_made"] += 1
+
+                if task_overview is None:
+                    break
+
+                task_id = task_overview.get("task_id")
+                target_sla = task_overview.get("target_sla")
+                target_reward = task_overview.get("target_reward", 1.0)
+                deadline_ms = task_overview.get("deadline_ms")
+
+                task = await accept_task(client, task_id, target_sla, backoff)
+                if task is None:
+                    break
+
+                if await task_holder.add_task(task):
+                    prefetched += 1
+                    logger.debug("task_prefetched", task_id=task_id)
+                else:
+                    break
+
+            return prefetched
+
         while True:
             try:
                 # 速率限制: /query ≤ 32/s
@@ -654,65 +848,29 @@ async def main_loop():
                 if wait_time > 0:
                     await asyncio.sleep(wait_time)
 
-                # 检查持有容量
-                if not await task_holder.has_capacity():
-                    print(f"[Client] 已达到最大持有任务数 ({MAX_HELD_TASKS}),等待...")
-                    await asyncio.sleep(1)
-                    continue
+                # 检查优雅关闭
+                if shutdown_manager.is_shutting_down:
+                    logger.info("main_loop_stopping", reason="shutdown")
+                    break
 
-                # 查询任务
-                task_overview = await query_task(client, backoff)
-                stats["queries_made"] += 1
+                # 预取任务
+                prefetched = await prefetch_tasks()
+                if prefetched > 0:
+                    logger.debug("prefetch_batch", count=prefetched)
 
-                if task_overview is None:
-                    # 没有可用任务,快速轮询
+                # 如果持有器接近满,短暂休息让 worker 处理
+                holder_stats = await task_holder.get_stats()
+                if holder_stats["capacity"] < 4:
                     await asyncio.sleep(0.1)
-                    continue
 
-                backoff.record_success()
-                task_id = task_overview.get("task_id")
-                target_sla = task_overview.get("target_sla")
-                target_reward = task_overview.get("target_reward", 1.0)
-                deadline_ms = task_overview.get("deadline_ms")
-
-                print(f"[Client] 发现任务 {task_id} (SLA: {target_sla}, "
-                      f"奖励: {target_reward}, 截止: {deadline_ms}ms)")
-
-                # 快速接受任务
-                task = await accept_task(client, task_id, target_sla, backoff)
-
-                if task is None:
-                    await asyncio.sleep(0.1)
-                    continue
-
-                # 添加到持有器
-                if await task_holder.add_task(task):
-                    print(f"[Client] 任务 {task_id} 已持有 (持有数: {await task_holder.size()})")
-                else:
-                    # 容量满,同步处理
-                    print(f"[Client] 持有器满,同步处理任务 {task_id}")
-                    start_time = time.monotonic()
-                    success = await process_task(client, task, backoff, target_sla)
-                    elapsed = time.monotonic() - start_time
-
-                    async with asyncio.Lock():
-                        if success:
-                            stats["tasks_completed"] += 1
-                            stats["total_inference_time"] += elapsed
-                        else:
-                            stats["tasks_failed"] += 1
-
-            except KeyboardInterrupt:
-                print("\n[Client] 收到中断信号,正在退出...")
-                worker_task.cancel()
-                try:
-                    await worker_task
-                except asyncio.CancelledError:
-                    pass
-                break
             except Exception as e:
-                print(f"[Client] 循环错误: {e}")
+                logger.error("main_loop_error", error=str(e))
                 await asyncio.sleep(1)
+
+        # 等待所有 worker 完成
+        logger.info("waiting_for_workers")
+        await asyncio.gather(*workers, return_exceptions=True)
+        logger.info("all_workers_stopped")
 
 
 def main():

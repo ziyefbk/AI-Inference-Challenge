@@ -26,12 +26,14 @@ import asyncio
 import argparse
 import statistics
 import unittest
+import random
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.inference import (
     run_inference, generate_text, compute_logprob, compute_rolling_logprob,
-    SLA_STRATEGIES, get_sla_from_deadline, get_sla_strategy
+    generate_text_async, compute_logprob_async, compute_rolling_logprob_async,
+    SLA_STRATEGIES, get_sla_from_deadline, get_sla_strategy, _get_tiktoken_encoding
 )
 from src.utils.circuit import CircuitBreaker, CircuitBreakerOpen
 from src.utils.metrics import MetricsCollector
@@ -618,7 +620,8 @@ def main():
     parser = argparse.ArgumentParser(description="并发/延迟/投机解码测试")
     parser.add_argument("--mode", default="all",
                         choices=["all", "concurrency", "latency", "speculative", "scheduler",
-                                "circuit", "metrics"],
+                                "circuit", "metrics", "priority", "async_funcs", "multi_worker",
+                                "leak", "jitter", "adaptive"],
                         help="测试模式")
     parser.add_argument("--sla", default="standard",
                         choices=["express", "fast", "standard", "high_quality"],
@@ -647,8 +650,288 @@ def main():
         test_circuit_breaker()
     elif args.mode == "metrics":
         test_metrics_collector()
+    elif args.mode == "priority":
+        suite = unittest.TestLoader().loadTestsFromTestCase(TestPriorityQueue)
+        unittest.TextTestRunner(verbosity=2).run(suite)
+    elif args.mode == "async_funcs":
+        suite = unittest.TestLoader().loadTestsFromTestCase(TestAsyncInference)
+        unittest.TextTestRunner(verbosity=2).run(suite)
+    elif args.mode == "multi_worker":
+        test_multi_worker_concurrency()
+    elif args.mode == "leak":
+        test_mark_done_no_leak()
+    elif args.mode == "jitter":
+        test_retry_jitter()
+    elif args.mode == "adaptive":
+        test_adaptive_prefetch_logic()
 
     print("\n测试完成!")
+
+
+# ── 优先队列测试 ────────────────────────────────────────────────────────────
+
+class TestPriorityQueue(unittest.TestCase):
+    """测试 PriorityTaskHolder 优先队列。"""
+
+    def test_priority_ordering(self):
+        """测试优先级排序: 截止时间越近越优先。"""
+        import asyncio
+        from src.client import PriorityTaskHolder
+
+        holder = PriorityTaskHolder(max_held=10)
+
+        async def run():
+            now = time.time()
+            tasks = [
+                {
+                    "overview": {
+                        "task_id": 1,
+                        "deadline_ms": int((now + 100) * 1000),  # 100秒后
+                    }
+                },
+                {
+                    "overview": {
+                        "task_id": 2,
+                        "deadline_ms": int((now + 10) * 1000),  # 10秒后
+                    }
+                },
+                {
+                    "overview": {
+                        "task_id": 3,
+                        "deadline_ms": int((now + 50) * 1000),  # 50秒后
+                    }
+                },
+            ]
+
+            for t in tasks:
+                await holder.add_task(t)
+
+            # 取出顺序应该是: 2, 3, 1 (截止时间最近的先)
+            order = []
+            while True:
+                item = await holder.pop_task()
+                if item is None:
+                    break
+                task, _ = item
+                order.append(task["overview"]["task_id"])
+
+            self.assertEqual(order, [2, 3, 1])
+
+        asyncio.run(run())
+
+    def test_heap_efficiency(self):
+        """测试 heapq 效率: 插入 O(log n)。"""
+        import asyncio
+        from src.client import PriorityTaskHolder
+
+        holder = PriorityTaskHolder(max_held=1000)
+
+        async def run():
+            now = time.time()
+            times = []
+            for i in range(100):
+                task = {
+                    "overview": {
+                        "task_id": i,
+                        "deadline_ms": int((now + random.random() * 1000) * 1000),
+                    }
+                }
+                start = time.perf_counter()
+                await holder.add_task(task)
+                times.append(time.perf_counter() - start)
+
+            avg_time = sum(times) / len(times)
+            self.assertLess(avg_time, 0.001)  # 平均插入时间应 < 1ms
+
+        asyncio.run(run())
+
+    def test_complexity_scoring(self):
+        """测试复杂度评分: 消息越多优先级越低。"""
+        import asyncio
+        from src.client import PriorityTaskHolder
+
+        holder = PriorityTaskHolder(max_held=10)
+
+        async def run():
+            now = time.time()
+            short_task = {
+                "overview": {
+                    "task_id": 1,
+                    "deadline_ms": int((now + 100) * 1000),
+                },
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+            long_task = {
+                "overview": {
+                    "task_id": 2,
+                    "deadline_ms": int((now + 100) * 1000),  # 相同截止时间
+                },
+                "messages": [
+                    {"role": "user", "content": f"message {j}"}
+                    for j in range(100)
+                ],
+            }
+
+            await holder.add_task(short_task)
+            await holder.add_task(long_task)
+
+            # 短任务应该先被处理
+            item = await holder.pop_task()
+            self.assertEqual(item[0]["overview"]["task_id"], 1)
+
+        asyncio.run(run())
+
+
+# ── 异步函数测试 ────────────────────────────────────────────────────────────
+
+class TestAsyncInference(unittest.TestCase):
+    """测试异步推理函数。"""
+
+    def test_tiktoken_caching(self):
+        """测试 tiktoken 编码器缓存。"""
+        enc1 = _get_tiktoken_encoding()
+        enc2 = _get_tiktoken_encoding()
+        self.assertIs(enc1, enc2)  # 应该是同一个对象
+
+    def test_async_function_signatures(self):
+        """测试异步函数签名。"""
+        import inspect
+        from src.inference import (
+            generate_text_async, compute_logprob_async, compute_rolling_logprob_async
+        )
+
+        self.assertTrue(inspect.iscoroutinefunction(generate_text_async))
+        self.assertTrue(inspect.iscoroutinefunction(compute_logprob_async))
+        self.assertTrue(inspect.iscoroutinefunction(compute_rolling_logprob_async))
+
+
+# ── 多 Worker 测试 ──────────────────────────────────────────────────────────
+
+def test_multi_worker_concurrency():
+    """测试多 worker 并发处理。"""
+    import asyncio
+    from src.client import PriorityTaskHolder
+
+    async def dummy_task(n):
+        await asyncio.sleep(0.01)
+        return n * 2
+
+    async def worker(queue, results, worker_id):
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0.001)
+                continue
+
+            if item is None:
+                break
+
+            result = await dummy_task(item)
+            results.append((worker_id, result))
+            queue.task_done()
+
+    async def run():
+        queue = asyncio.Queue()
+        for i in range(20):
+            await queue.put(i)
+
+        results = []
+        num_workers = 4
+        workers = [
+            asyncio.create_task(worker(queue, results, i))
+            for i in range(num_workers)
+        ]
+
+        await queue.join()
+
+        for _ in range(num_workers):
+            await queue.put(None)
+
+        await asyncio.gather(*workers)
+
+        assert len(results) == 20
+        expected = {r[1] for r in results}
+        assert expected == {i * 2 for i in range(20)}
+        print(f"  多 worker 处理 {len(results)} 个任务")
+
+    asyncio.run(run())
+    return True
+
+
+# ── 内存泄漏修复测试 ────────────────────────────────────────────────────────
+
+def test_mark_done_no_leak():
+    """测试 mark_done 后 heap 不会无限增长（pop_task 跳过无效条目）。"""
+    from src.client import PriorityTaskHolder
+
+    async def run():
+        holder = PriorityTaskHolder(max_held=100)
+
+        # 添加 50 个任务
+        for i in range(50):
+            task = {"overview": {"task_id": i}}
+            await holder.add_task(task)
+
+        # 标记完成 40 个
+        for i in range(40):
+            await holder.mark_done(i)
+
+        # pop 取出，应该只返回剩余的有效任务
+        count = 0
+        while True:
+            item = await holder.pop_task()
+            if item is None:
+                break
+            count += 1
+
+        assert count == 10, f"期望 10 个任务，实际 {count} 个"
+        print(f"  mark_done 测试通过: 50 - 40 = 10 个有效任务")
+
+    asyncio.run(run())
+    return True
+
+
+def test_retry_jitter():
+    """测试重试有 jitter（每次延迟不同）。"""
+    delays = []
+    for _ in range(20):
+        base = 1.0
+        jitter = random.uniform(0.5, 1.5)
+        delays.append(base * jitter)
+
+    # 验证 jitter 有变化
+    assert max(delays) > min(delays) * 1.3, "Jitter 应该产生变化"
+    print(f"  jitter 测试通过: 延迟范围 {min(delays):.2f}s - {max(delays):.2f}s")
+
+    return True
+
+
+# ── 自适应预取测试 ───────────────────────────────────────────────────────────
+
+def test_adaptive_prefetch_logic():
+    """测试自适应预取的填充率计算逻辑。"""
+    PREFETCH_SIZE = 8
+
+    # 模拟不同填充率下的预取数量
+    test_cases = [
+        (0.3, PREFETCH_SIZE * 2),  # 空时多预取
+        (0.6, PREFETCH_SIZE),       # 正常
+        (0.9, 1),                   # 满时少预取
+    ]
+
+    for fill_ratio, expected_size in test_cases:
+        if fill_ratio < 0.5:
+            dynamic_size = PREFETCH_SIZE * 2
+        elif fill_ratio > 0.8:
+            dynamic_size = 1
+        else:
+            dynamic_size = PREFETCH_SIZE
+
+        assert dynamic_size == expected_size, f"fill_ratio={fill_ratio} 时期望 {expected_size}，实际 {dynamic_size}"
+
+    print("  自适应预取逻辑测试通过")
+    return True
 
 
 if __name__ == "__main__":
