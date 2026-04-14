@@ -18,8 +18,7 @@ import random
 import time
 import json
 from typing import Dict, Any, Optional, List
-from dataclasses import dataclass, field
-from collections import deque
+from dataclasses import dataclass
 
 # 将 src 目录加入 Python 路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -142,119 +141,11 @@ class BackoffState:
 
 # ── 任务持有管理器 ──────────────────────────────────────────────────────────
 
-class TaskHolder:
-    """
-    管理已接受但未提交的任务。
-    支持:
-    - 最多持有 64 个任务 (Q56-Q4)
-    - 任务超时追踪 (300s 领取超时)
-    - 按截止时间排序处理
-    """
-
-    def __init__(self, max_held: int = MAX_HELD_TASKS, timeout_s: int = TASK_ACCEPT_TIMEOUT):
-        self.max_held = max_held
-        self.timeout_s = timeout_s
-        self.tasks: deque = deque()  # (task, accept_time)
-        self._lock = asyncio.Lock()
-
-    async def add_task(self, task: Dict[str, Any]) -> bool:
-        """添加任务,超容返回 False。"""
-        async with self._lock:
-            if len(self.tasks) >= self.max_held:
-                return False
-            accept_time = time.monotonic()
-            self.tasks.append((task, accept_time))
-            self._sort_by_deadline()
-            return True
-
-    def _sort_by_deadline(self):
-        """按截止时间排序,最紧急的在前。"""
-        def get_deadline(item):
-            task, _ = item
-            overview = task.get("overview", {})
-            if isinstance(overview, dict):
-                deadline_ms = overview.get("deadline_ms")
-                if deadline_ms:
-                    return deadline_ms
-            return float("inf")
-
-        self.tasks = deque(sorted(self.tasks, key=get_deadline))
-
-    async def get_task(self) -> Optional[tuple]:
-        """获取下一个待处理任务(不移除)。"""
-        async with self._lock:
-            if self.tasks:
-                return self.tasks[0]
-            return None
-
-    async def pop_task(self) -> Optional[tuple]:
-        """取出并移除最早的任务。"""
-        async with self._lock:
-            if self.tasks:
-                return self.tasks.popleft()
-            return None
-
-    async def mark_done(self, task_id: int) -> bool:
-        """标记任务完成,从持有列表中移除。"""
-        async with self._lock:
-            for i, (task, _) in enumerate(self.tasks):
-                task_overview = task.get("overview", {})
-                if task_overview.get("task_id") == task_id:
-                    del self.tasks[i]
-                    return True
-            return False
-
-    async def get_expired(self) -> List[tuple]:
-        """获取已超时的任务。"""
-        now = time.monotonic()
-        expired = []
-        valid = deque()
-
-        async with self._lock:
-            for item in self.tasks:
-                task, accept_time = item
-                if now - accept_time > self.timeout_s:
-                    expired.append(item)
-                else:
-                    valid.append(item)
-            self.tasks = valid
-
-        return expired
-
-    async def size(self) -> int:
-        """获取当前持有任务数。"""
-        async with self._lock:
-            return len(self.tasks)
-
-    async def has_capacity(self) -> bool:
-        """检查是否还有容量接受新任务。"""
-        async with self._lock:
-            return len(self.tasks) < self.max_held
-
-    async def get_stats(self) -> Dict[str, Any]:
-        """获取持有器统计。"""
-        async with self._lock:
-            now = time.monotonic()
-            expired_count = sum(
-                1 for _, accept_time in self.tasks
-                if now - accept_time > self.timeout_s
-            )
-            return {
-                "held": len(self.tasks),
-                "max": self.max_held,
-                "expired": expired_count,
-                "capacity": self.max_held - len(self.tasks),
-            }
-
-
 import heapq
 
 
 class PriorityTaskHolder:
-    """
-    基于 heapq 优先队列的任务持有器。
-    支持多维度优先级排序，比 TaskHolder 更高效。
-    """
+    """基于 heapq 优先队列的任务持有器，支持多维度优先级排序。"""
 
     def __init__(self, max_held: int = MAX_HELD_TASKS, timeout_s: int = TASK_ACCEPT_TIMEOUT):
         self.max_held = max_held

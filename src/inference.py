@@ -467,9 +467,3 @@ def run_inference(
             results.append(r)
 
     return _aggregate_task_results(results)
-
-
-# 别名导出(兼容旧代码)
-generate_text_async = generate_text
-compute_logprob_async = compute_logprob
-compute_rolling_logprob_async = compute_rolling_logprob

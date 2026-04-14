@@ -314,37 +314,3 @@ class GracefulShutdown:
 
 # 全局单例
 shutdown_manager = GracefulShutdown()
-
-
-# ── 同步版本工具 ─────────────────────────────────────────────────────────
-
-class SyncGracefulShutdown:
-    """
-    同步版本的优雅关闭。
-
-    用于非 async 环境。
-    """
-
-    def __init__(self, timeout: float = 60.0):
-        self.timeout = timeout
-        self._shutting_down = False
-        self._lock = threading.Lock()
-
-    def register_handler(self):
-        """注册信号处理器。"""
-        def handler(signum, frame):
-            with self._lock:
-                self._shutting_down = True
-            print(f"\n[Shutdown] 收到信号，准备关闭...")
-
-        signal.signal(signal.SIGTERM, handler)
-        signal.signal(signal.SIGINT, handler)
-
-    @property
-    def is_shutting_down(self) -> bool:
-        with self._lock:
-            return self._shutting_down
-
-    def begin_shutdown(self):
-        with self._lock:
-            self._shutting_down = True
