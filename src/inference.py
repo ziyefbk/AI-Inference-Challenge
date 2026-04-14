@@ -133,29 +133,30 @@ def _apply_stop_strings(text: str, stop_list: List[str]) -> str:
 
 
 SLA_STRATEGIES: Dict[str, Dict[str, Any]] = {
+    # Q60: prompt限制4K以内; Q73: 模型开启thinking mode
     "express": {
-        "max_model_len": 2048, "temperature": 0.0, "top_p": 1.0, "top_k": 1,
-        "max_gen_toks": 64, "repetition_penalty": 1.0, "frequency_penalty": 0.0,
+        "max_model_len": 4096, "temperature": 0.0, "top_p": 1.0, "top_k": 1,
+        "max_gen_toks": 32, "repetition_penalty": 1.0, "frequency_penalty": 0.0,
         "presence_penalty": 0.0, "beam_size": 1, "logprobs_requested": 1,
         "n": 1,
     },
     "fast": {
         "max_model_len": 4096, "temperature": 0.1, "top_p": 0.95, "top_k": 20,
-        "max_gen_toks": 128, "repetition_penalty": 1.05, "frequency_penalty": 0.0,
+        "max_gen_toks": 64, "repetition_penalty": 1.05, "frequency_penalty": 0.0,
         "presence_penalty": 0.0, "beam_size": 1, "logprobs_requested": 5,
         "n": 1,
     },
     "standard": {
-        "max_model_len": 8192, "temperature": 0.7, "top_p": 0.9, "top_k": 50,
-        "max_gen_toks": 256, "repetition_penalty": 1.1, "frequency_penalty": 0.0,
+        "max_model_len": 4096, "temperature": 0.7, "top_p": 0.9, "top_k": 50,
+        "max_gen_toks": 128, "repetition_penalty": 1.1, "frequency_penalty": 0.0,
         "presence_penalty": 0.0, "beam_size": 1, "logprobs_requested": 20,
         "n": 1,
     },
     "high_quality": {
-        "max_model_len": 8192, "temperature": 0.8, "top_p": 0.95, "top_k": -1,
-        "max_gen_toks": 512, "repetition_penalty": 1.2, "frequency_penalty": 0.1,
-        "presence_penalty": 0.1, "beam_size": 2, "logprobs_requested": 100,
-        "n": 4,
+        "max_model_len": 4096, "temperature": 0.8, "top_p": 0.95, "top_k": -1,
+        "max_gen_toks": 256, "repetition_penalty": 1.2, "frequency_penalty": 0.1,
+        "presence_penalty": 0.1, "beam_size": 1, "logprobs_requested": 100,
+        "n": 1,
     },
 }
 
@@ -210,13 +211,21 @@ def warmup_model():
         return
 
     logger.info("[推理] 开始预热模型...")
-    prompts = ["Hello", "What is 2+2?", "The capital of France", "Once upon", "In the"]
-    for i in range(CONCURRENCY_CONFIG["warmup_requests"]):
-        try:
-            asyncio.run(_call_vllm(prompt=prompts[i % len(prompts)], max_tokens=8,
-                                   temperature=0.0, top_p=1.0, top_k=1))
-        except Exception:
-            pass
+    # 预热多种SLA级别和提示,确保CUDA Graph充分构建
+    warmup_prompts = [
+        ("Hello", "express"),
+        ("What is 2+2?", "fast"),
+        ("The capital of France is", "standard"),
+        ("Explain quantum physics", "standard"),
+        ("Write a short story", "high_quality"),
+    ]
+    for prompt, sla in warmup_prompts:
+        for _ in range(3):  # 多次预热确保CUDA graph构建
+            try:
+                asyncio.run(_call_vllm(prompt=prompt, max_tokens=8,
+                                       temperature=0.0, top_p=1.0, top_k=1))
+            except Exception:
+                pass
     _model_warmed_up = True
 
 

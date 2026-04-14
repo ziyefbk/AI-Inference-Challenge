@@ -177,12 +177,21 @@ def start_vllm_background():
         "--model", MODEL_PATH,
         "--port", str(VLLM_PORT),
         "--gpu-memory-utilization", "0.9",
-        "--enforce-eager",
         # 性能优化参数
         "--max-model-len", "8192",  # 限制上下文长度以节省显存
-        "--block-size", "16",  # 更大的块以提高吞吐
+        "--block-size", "32",  # 更大的块以提高吞吐
         "--disable-log-requests",  # 减少日志开销
+        "--enable-prefix-caching",  # 前缀缓存,减少重复计算
     ]
+
+    # speculative decoding 支持 (Q33: 允许使用小模型进行投机解码)
+    SPECULATIVE_MODEL = os.environ.get("SPECULATIVE_MODEL", "")
+    if SPECULATIVE_MODEL:
+        vllm_cmd.extend([
+            "--speculative-model", SPECULATIVE_MODEL,
+            "--num-speculative-tokens", os.environ.get("SPECULATIVE_DRAFT_TOKENS", "4"),
+        ])
+        print(f"[Main] 启用投机解码: {SPECULATIVE_MODEL}")
 
     # 多 GPU 时启用 tensor parallelism
     if num_gpus > 1:

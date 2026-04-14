@@ -157,8 +157,8 @@ class PriorityTaskHolder:
 
     def _compute_priority(self, task: Dict[str, Any], accept_time: float) -> float:
         """
-        计算任务优先级分数。
-        分数越小越优先: 剩余时间越少越紧急。
+        计算任务优先级分数,越小越优先。
+        Q62: target_reward 正比于推理计算量
         """
         overview = task.get("overview", {})
         if not isinstance(overview, dict):
@@ -170,19 +170,36 @@ class PriorityTaskHolder:
         sla = overview.get("target_sla", "standard")
 
         now = time.monotonic()
-        remaining = deadline_ms / 1000.0 - now  # 剩余秒数
+        remaining = deadline_ms / 1000.0 - now
+
+        # 已过期或接近过期
+        if remaining < 0:
+            return float("-inf")
 
         # 紧迫度权重: 越接近截止时间越优先
         urgency_weight = 1.0
+
         # 复杂度惩罚: 消息越多估计耗时越长
-        complexity_penalty = msg_count * 0.5
-        # 奖励调整: 高奖励任务略微优先
-        reward_bonus = (reward - 1.0) * 5.0
+        complexity_penalty = msg_count * 0.3
 
-        # SLA 等级调整
-        sla_adjustment = {"express": -10, "fast": -5, "standard": 0, "high_quality": 5}.get(sla, 0)
+        # 奖励调整: 高奖励/剩余时间比的任务优先 (Q62)
+        reward_factor = reward / max(remaining, 1.0) * 10.0
 
-        return remaining * urgency_weight + complexity_penalty - reward_bonus + sla_adjustment
+        # SLA 等级调整 (高SLA需要更快的响应)
+        sla_adjustment = {
+            "express": -20,
+            "fast": -10,
+            "standard": 0,
+            "high_quality": 5
+        }.get(sla, 0)
+
+        # 计算最终优先级
+        priority = remaining * urgency_weight + complexity_penalty - reward_factor + sla_adjustment
+
+        # 加上轻微的随机扰动,避免完全相同的任务饥饿
+        priority += random.uniform(-0.5, 0.5)
+
+        return priority
 
     async def add_task(self, task: Dict[str, Any]) -> bool:
         """添加任务,超容返回 False。"""
@@ -256,6 +273,19 @@ class PriorityTaskHolder:
 
         return expired
 
+    async def should_check_expired(self) -> bool:
+        """根据持有器填充率动态决定是否检查过期任务"""
+        fill_ratio = len(self._heap) / max(self.max_held, 1)
+        _check_counter = getattr(self, '_check_counter', 0)
+
+        # 高填充率时更频繁检查过期任务
+        if fill_ratio > 0.7:
+            return True
+        elif fill_ratio > 0.4:
+            return _check_counter >= 3
+        else:
+            return _check_counter >= 5
+
     async def size(self) -> int:
         """获取当前持有任务数。"""
         async with self._lock:
@@ -287,18 +317,18 @@ class PriorityTaskHolder:
 # 为不同 API 维护独立的熔断器
 _query_breaker = CircuitBreaker(
     name="query",
-    failure_threshold=10,
-    timeout=60.0,
+    failure_threshold=15,  # 提高阈值，避免频繁熔断 (Q56-Q7: 32/s限制)
+    timeout=30.0,
 )
 _ask_breaker = CircuitBreaker(
     name="ask",
-    failure_threshold=5,
-    timeout=120.0,
+    failure_threshold=10,
+    timeout=60.0,
 )
 _submit_breaker = CircuitBreaker(
     name="submit",
     failure_threshold=5,
-    timeout=120.0,
+    timeout=120.0,  # 提交重要，需要更长时间恢复
 )
 
 
@@ -464,8 +494,8 @@ async def accept_task(client: httpx.AsyncClient, task_id: int, target_sla: str, 
     return None
 
 
-async def submit_results(client: httpx.AsyncClient, task_data: Dict[str, Any], backoff: Optional[BackoffState] = None, max_retries: int = 3) -> bool:
-    """提交推理结果,包含重试逻辑,带熔断器保护。"""
+async def submit_results(client: httpx.AsyncClient, task_data: Dict[str, Any], backoff: Optional[BackoffState] = None, max_retries: int = 5) -> bool:
+    """提交推理结果,包含重试逻辑,带熔断器保护。提交重要,使用较多重试次数。"""
     # 检查熔断器
     if not await _submit_breaker.can_attempt():
         retry_after = _submit_breaker._retry_after()
@@ -615,10 +645,10 @@ async def main_loop():
                 # 获取下一个任务
                 item = await task_holder.pop_task()
                 if item is None:
-                    # 只有在空闲时才检查过期任务，减少堆遍历开销
+                    # 只有在空闲时才检查过期任务，根据填充率动态调整频率
                     _check_counter = getattr(task_holder, '_check_counter', 0) + 1
                     task_holder._check_counter = _check_counter
-                    if _check_counter >= 5:  # 每 5 次空闲检查一次过期
+                    if await task_holder.should_check_expired():
                         expired = await task_holder.get_expired()
                         for task, _ in expired:
                             task_id = task.get("overview", {}).get("task_id")
