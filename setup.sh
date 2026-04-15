@@ -12,11 +12,17 @@ done
 echo "使用 Python: $PYTHON_BIN"
 $PYTHON_BIN --version
 
-# 如需要则创建虚拟环境
-if [ ! -d ./tmp/contestant_env ]; then
-    $PYTHON_BIN -m venv ./tmp/contestant_env
+# 使用 conda 创建/更新环境
+ENV_NAME="quant"
+if conda env list | grep -q "^${ENV_NAME} "; then
+    echo "更新 conda 环境: $ENV_NAME"
+    conda env update -n "$ENV_NAME" -f environment.yml 2>/dev/null || true
+else
+    echo "创建 conda 环境: $ENV_NAME"
+    conda env create -n "$ENV_NAME" -f environment.yml
 fi
 
-source ./tmp/contestant_env/bin/activate
+eval "$(conda shell.bash hook)"
+conda activate "$ENV_NAME"
 pip install --upgrade pip
 pip install -r requirements.txt
