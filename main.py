@@ -45,9 +45,9 @@ def validate_config():
     errors = []
 
     # TOKEN 验证
-    TOKEN = os.environ.get("CONTESTANT_TOKEN", "")
-    if not TOKEN or TOKEN == "your_secret_token":
-        errors.append("CONTESTANT_TOKEN 未设置或为默认值")
+    TOKEN = os.environ.get("TEAM_TOKEN", "")
+    if not TOKEN:
+        errors.append("TEAM_TOKEN 未设置")
 
     # MODEL_PATH 验证
     MODEL_PATH = os.environ.get("MODEL_PATH", "")
@@ -173,13 +173,12 @@ def start_vllm_background():
 
     # vLLM 启动命令,包含优化参数
     vllm_cmd = [
-        PYTHON_BIN, "-m", "vllm.entrypoints.api_server",
+        PYTHON_BIN, "-m", "vllm.entrypoints.openai.api_server",
         "--model", MODEL_PATH,
         "--port", str(VLLM_PORT),
         "--gpu-memory-utilization", "0.9",
         # 性能优化参数
         "--max-model-len", "8192",  # 限制上下文长度以节省显存
-        "--block-size", "32",  # 更大的块以提高吞吐
         "--disable-log-requests",  # 减少日志开销
         "--enable-prefix-caching",  # 前缀缓存,减少重复计算
     ]
@@ -349,9 +348,9 @@ def main():
     if args.port:
         os.environ["CONTESTANT_PORT"] = str(args.port)
     if args.token:
-        os.environ["CONTESTANT_TOKEN"] = args.token
+        os.environ["TEAM_TOKEN"] = args.token
     if args.name:
-        os.environ["CONTESTANT_NAME"] = args.name
+        os.environ["TEAM_NAME"] = args.name
     if args.platform_url:
         os.environ["PLATFORM_URL"] = args.platform_url
     if args.model_path:

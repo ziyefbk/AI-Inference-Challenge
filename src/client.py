@@ -33,8 +33,8 @@ from src.inference import run_inference
 
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://10.0.0.1:8003")
-TOKEN = os.environ.get("CONTESTANT_TOKEN", "your_secret_token")
-TEAM_NAME = os.environ.get("CONTESTANT_NAME", "team_alpha")
+TOKEN = os.environ.get("TEAM_TOKEN", "")
+TEAM_NAME = os.environ.get("TEAM_NAME", "contestant")
 CONTESTANT_PORT = int(os.environ.get("CONTESTANT_PORT", "9000"))
 
 # Q&A 约束常量

@@ -476,3 +476,19 @@ def run_inference(
             results.append(r)
 
     return _aggregate_task_results(results)
+
+
+async def _close_async_client():
+    """关闭全局异步客户端。"""
+    global _vllm_async_client
+    if _vllm_async_client is not None:
+        await _vllm_async_client.aclose()
+        _vllm_async_client = None
+
+
+def close_vllm_client():
+    """同步关闭 vLLM 客户端（供 main.py 调用）。"""
+    try:
+        asyncio.run(_close_async_client())
+    except Exception as e:
+        logger.warning(f"关闭 vLLM 客户端时出错: {e}")
