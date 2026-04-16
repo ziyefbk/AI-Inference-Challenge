@@ -110,18 +110,9 @@ async def _call_vllm(
 
     client = await _get_vllm_async_client()
     for attempt in range(RETRY_CONFIG["max_retries"] + 1):
-        try:
-            resp = await client.post(f"{VLLM_URL}/v1/completions", json=payload)
-            resp.raise_for_status()
-            return resp.json()
-        except (httpx.HTTPError, httpx.TimeoutException) as e:
-            if attempt < RETRY_CONFIG["max_retries"]:
-                await asyncio.sleep(
-                    min(RETRY_CONFIG["backoff_factor"] ** attempt, RETRY_CONFIG["max_backoff"])
-                    * (0.5 + random.random())
-                )
-            else:
-                raise
+        resp = await client.post(f"{VLLM_URL}/v1/completions", json=payload)
+        resp.raise_for_status()
+        return resp.json()
 
 
 def _apply_stop_strings(text: str, stop_list: List[str]) -> str:
@@ -188,15 +179,12 @@ def load_config():
     global SAMPLING_PARAMS, SLA_LEVELS
     if not CONFIG_PATH or not os.path.exists(CONFIG_PATH):
         return
-    try:
-        with open(CONFIG_PATH) as f:
-            config = json.load(f)
-        if "sampling_params" in config:
-            SAMPLING_PARAMS = config["sampling_params"]
-        if "sla_levels" in config:
-            SLA_LEVELS = config["sla_levels"]
-    except Exception:
-        pass
+    with open(CONFIG_PATH) as f:
+        config = json.load(f)
+    if "sampling_params" in config:
+        SAMPLING_PARAMS = config["sampling_params"]
+    if "sla_levels" in config:
+        SLA_LEVELS = config["sla_levels"]
 
 
 load_config()
@@ -221,11 +209,8 @@ def warmup_model():
     ]
     for prompt, sla in warmup_prompts:
         for _ in range(3):  # 多次预热确保CUDA graph构建
-            try:
-                asyncio.run(_call_vllm(prompt=prompt, max_tokens=8,
-                                       temperature=0.0, top_p=1.0, top_k=1))
-            except Exception:
-                pass
+            asyncio.run(_call_vllm(prompt=prompt, max_tokens=8,
+                                   temperature=0.0, top_p=1.0, top_k=1))
     _model_warmed_up = True
 
 
@@ -261,17 +246,13 @@ async def generate_text(
 ) -> str:
     """异步文本生成,带停止条件."""
     p = _resolve_gen_params(gen_kwargs, sla_strategy)
-    try:
-        resp = await _call_vllm(
-            prompt=prompt, max_tokens=p["max_gen_toks"], temperature=p["temperature"],
-            top_p=p["top_p"], top_k=p["top_k"], stop=p["until"],
-            repetition_penalty=p["repetition_penalty"], frequency_penalty=p["frequency_penalty"],
-            presence_penalty=p["presence_penalty"], max_model_len=p["max_model_len"],
-            beam_size=p["beam_size"], best_of=p["best_of"],
-        )
-    except Exception as e:
-        logger.error(f"[Inference] 文本生成失败: {e}")
-        return ""
+    resp = await _call_vllm(
+        prompt=prompt, max_tokens=p["max_gen_toks"], temperature=p["temperature"],
+        top_p=p["top_p"], top_k=p["top_k"], stop=p["until"],
+        repetition_penalty=p["repetition_penalty"], frequency_penalty=p["frequency_penalty"],
+        presence_penalty=p["presence_penalty"], max_model_len=p["max_model_len"],
+        beam_size=p["beam_size"], best_of=p["best_of"],
+    )
 
     choices = resp.get("choices", [])
     if not choices:
@@ -289,22 +270,15 @@ async def compute_logprob(
     if not continuation:
         return 0.0
 
-    try:
-        enc = _get_tiktoken_encoding()
-        pt = len(enc.encode(prompt))
-        ct = len(enc.encode(continuation))
-        lp_req = pt + ct
-    except Exception:
-        lp_req = 200  # fallback: 确保覆盖
+    enc = _get_tiktoken_encoding()
+    pt = len(enc.encode(prompt))
+    ct = len(enc.encode(continuation))
+    lp_req = pt + ct
 
-    try:
-        resp = await _call_vllm(
-            prompt=prompt + continuation, max_tokens=1, logprobs=lp_req,
-            echo=True, temperature=0.0, top_p=1.0, top_k=1,
-        )
-    except Exception as e:
-        logger.error(f"[Inference] logprob 调用失败: {e}")
-        return -10.0
+    resp = await _call_vllm(
+        prompt=prompt + continuation, max_tokens=1, logprobs=lp_req,
+        echo=True, temperature=0.0, top_p=1.0, top_k=1,
+    )
 
     lps = resp.get("choices", [{}])[0].get("logprobs", {}).get("token_logprobs", [])
     if not lps or len(lps) < 2:
@@ -326,24 +300,17 @@ async def compute_rolling_logprob(
     if not text:
         return 0.0
 
-    try:
-        enc = _get_tiktoken_encoding()
-        num_tokens = len(enc.encode(text))
-        lp_req = min(num_tokens + 10, 2000)
-    except Exception:
-        lp_req = 1000
+    enc = _get_tiktoken_encoding()
+    num_tokens = len(enc.encode(text))
+    lp_req = min(num_tokens + 10, 2000)
 
     if sla_strategy:
         lp_req = max(lp_req, min(sla_strategy.get("logprobs_requested", 1000) * 10, 2000))
 
-    try:
-        resp = await _call_vllm(
-            prompt=text, max_tokens=1, logprobs=lp_req,
-            echo=True, temperature=0.0, top_p=1.0, top_k=1,
-        )
-    except Exception as e:
-        logger.error(f"[Inference] rolling logprob 调用失败: {e}")
-        return -10.0
+    resp = await _call_vllm(
+        prompt=text, max_tokens=1, logprobs=lp_req,
+        echo=True, temperature=0.0, top_p=1.0, top_k=1,
+    )
 
     lps = resp.get("choices", [{}])[0].get("logprobs", {}).get("token_logprobs", [])
     if not lps or len(lps) < 2:
@@ -399,37 +366,31 @@ async def _process_single_message(
     result = {"ID": msg_id, "prompt": prompt, "eval_request_type": rt}
     msg_start = time.time()
 
-    try:
-        if rt == "generate_until":
-            response_text = await generate_text(prompt, msg.get("eval_gen_kwargs"), sla_strategy)
-            result["response"] = response_text
-            result["accuracy"] = None
-            tokens = len(response_text.split()) if response_text else 0
-        elif rt == "loglikelihood":
-            logprob = await compute_logprob(prompt, msg.get("eval_continuation", ""), sla_strategy)
-            result["accuracy"] = logprob
-            result["response"] = None
-            tokens = len(msg.get("eval_continuation", "").split())
-        elif rt == "loglikelihood_rolling":
-            logprob = await compute_rolling_logprob(prompt, sla_strategy)
-            result["accuracy"] = logprob
-            result["response"] = None
-            tokens = len(prompt.split())
-        else:
-            result["response"] = None
-            result["accuracy"] = None
-            tokens = 0
-
-        elapsed = time.time() - msg_start
-        _metrics.observe_histogram("inference.latency", elapsed,
-                                   labels={"type": rt, "sla": (sla_strategy or {}).get("sla_level", "none")})
-        _metrics.inc_counter("inference.requests", labels={"type": rt, "status": "success"})
-        _metrics.inc_counter("inference.tokens", tokens, labels={"type": rt})
-    except Exception as e:
-        logger.error(f"[Inference] 处理消息 {msg_id} 出错: {e}")
+    if rt == "generate_until":
+        response_text = await generate_text(prompt, msg.get("eval_gen_kwargs"), sla_strategy)
+        result["response"] = response_text
+        result["accuracy"] = None
+        tokens = len(response_text.split()) if response_text else 0
+    elif rt == "loglikelihood":
+        logprob = await compute_logprob(prompt, msg.get("eval_continuation", ""), sla_strategy)
+        result["accuracy"] = logprob
+        result["response"] = None
+        tokens = len(msg.get("eval_continuation", "").split())
+    elif rt == "loglikelihood_rolling":
+        logprob = await compute_rolling_logprob(prompt, sla_strategy)
+        result["accuracy"] = logprob
+        result["response"] = None
+        tokens = len(prompt.split())
+    else:
         result["response"] = None
         result["accuracy"] = None
-        _metrics.inc_counter("inference.requests", labels={"type": rt, "status": "error"})
+        tokens = 0
+
+    elapsed = time.time() - msg_start
+    _metrics.observe_histogram("inference.latency", elapsed,
+                               labels={"type": rt, "sla": (sla_strategy or {}).get("sla_level", "none")})
+    _metrics.inc_counter("inference.requests", labels={"type": rt, "status": "success"})
+    _metrics.inc_counter("inference.tokens", tokens, labels={"type": rt})
 
     for k in ("eval_req_id", "eval_gen_kwargs", "eval_continuation"):
         if k in msg:
@@ -488,7 +449,4 @@ async def _close_async_client():
 
 def close_vllm_client():
     """同步关闭 vLLM 客户端（供 main.py 调用）。"""
-    try:
-        asyncio.run(_close_async_client())
-    except Exception as e:
-        logger.warning(f"关闭 vLLM 客户端时出错: {e}")
+    asyncio.run(_close_async_client())
