@@ -17,6 +17,7 @@ import argparse
 import random
 import time
 import json
+import subprocess
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 import requests
@@ -45,6 +46,79 @@ TASK_ACCEPT_TIMEOUT = 300  # 任务领取超时 300s (Q55)
 
 # Checkpoint 文件路径
 CHECKPOINT_FILE = os.environ.get("CHECKPOINT_FILE", "/tmp/client_checkpoint.json")
+
+# ── 任务完成时间估算配置 ──────────────────────────────────────────────
+
+# 基于SLA级别估算单message平均耗时（秒）
+SLA_MESSAGE_DURATIONS: Dict[str, float] = {
+    "express": 0.05,
+    "fast": 0.1,
+    "standard": 0.3,
+    "high_quality": 0.5,
+}
+
+# 额外开销（网络+提交）
+OVERHEAD_TIME = 0.3
+
+
+def estimate_task_duration(task: Dict[str, Any], sla_level: str) -> float:
+    """
+    估算任务完成所需时间（秒）。
+
+    考虑因素:
+    - SLA级别对应的单message耗时
+    - 任务中message数量
+    - 网络和提交开销
+
+    Args:
+        task: 任务字典
+        sla_level: SLA级别 (express/fast/standard/high_quality)
+
+    Returns:
+        预估完成时间（秒）
+    """
+    messages = task.get("messages", [])
+    msg_count = len(messages)
+
+    # 获取SLA级别对应的单message耗时
+    base_per_msg = SLA_MESSAGE_DURATIONS.get(sla_level, 0.3)
+
+    # 估算推理时间（考虑message数量和并发）
+    inference_time = base_per_msg * min(msg_count, 10)  # 最多10个并行估算
+
+    # 加上额外开销
+    total_time = inference_time + OVERHEAD_TIME
+
+    return max(total_time, 0.5)  # 最少0.5秒
+
+
+def estimate_task_feasible(task: Dict[str, Any], sla_level: str,
+                           buffer_factor: float = 1.3) -> bool:
+    """
+    判断任务是否可以在deadline前完成。
+
+    Args:
+        task: 任务字典
+        sla_level: SLA级别
+        buffer_factor: 时间buffer系数（留出余量）
+
+    Returns:
+        True: 可以完成
+        False: 必定超时，应该拒绝
+    """
+    deadline_ms = task.get("overview", {}).get("deadline_ms")
+    if deadline_ms is None:
+        return True  # 无deadline限制，默认可以完成
+
+    remaining = deadline_ms / 1000.0  # 转换为秒
+    est_duration = estimate_task_duration(task, sla_level)
+
+    # 如果剩余时间小于估算时间+buffer，判定为不可行
+    if remaining < est_duration * buffer_factor:
+        return False
+
+    return True
+
 
 # 连接池配置
 CLIENT_LIMITS = httpx.Limits(
@@ -457,6 +531,42 @@ async def accept_task(client: httpx.AsyncClient, task_id: int, target_sla: str, 
     return None
 
 
+async def reject_task(client: httpx.AsyncClient, task_id: int, backoff: Optional[BackoffState] = None, reason: str = "timeout_predicted") -> bool:
+    """
+    拒绝任务（预测必定超时）。
+
+    Args:
+        client: HTTP客户端
+        task_id: 任务ID
+        backoff: 退避状态
+        reason: 拒绝原因
+
+    Returns:
+        True: 拒绝成功
+        False: 拒绝失败
+    """
+    try:
+        resp = await client.post(
+            f"{PLATFORM_URL}/reject",
+            json={
+                "token": TOKEN,
+                "task_id": task_id,
+                "reason": reason,
+            },
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            logger.info("task_rejected_predicted_timeout", task_id=task_id, reason=reason)
+            metrics.inc_counter("client.tasks.rejected_timeout_predicted")
+            return True
+        else:
+            logger.warning("task_reject_failed", task_id=task_id, status=resp.status_code)
+            return False
+    except Exception as e:
+        logger.error("task_reject_error", task_id=task_id, error=str(e))
+        return False
+
+
 async def submit_results(client: httpx.AsyncClient, task_data: Dict[str, Any], backoff: Optional[BackoffState] = None, max_retries: int = 5) -> bool:
     """提交推理结果,包含重试逻辑,带熔断器保护。提交重要,使用较多重试次数。"""
     if not await _submit_breaker.can_attempt():
@@ -571,9 +681,32 @@ async def main_loop():
     rate_limiter = RateLimiter(max_rate=MAX_QUERY_RATE, burst=MAX_QUERY_RATE)
     task_holder = PriorityTaskHolder(max_held=MAX_HELD_TASKS, timeout_s=TASK_ACCEPT_TIMEOUT)
 
-    # Worker 数量配置
-    NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "3"))
+    # ── 动态Worker数量配置 ──
+    # 根据GPU数量自动调整worker数量
+    base_workers = int(os.environ.get("NUM_WORKERS", "3"))
     PREFETCH_SIZE = int(os.environ.get("PREFETCH_SIZE", "8"))
+
+    # 检测GPU数量
+    num_gpus = 1
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            num_gpus = len(result.stdout.strip().split("\n"))
+    except Exception:
+        pass
+
+    # 根据GPU数量调整worker
+    if num_gpus > 1:
+        # 多GPU环境：增加worker数量
+        NUM_WORKERS = min(base_workers + num_gpus, 12)  # 最多12个worker
+        logger.info("multi_gpu_config", num_gpus=num_gpus, num_workers=NUM_WORKERS)
+    else:
+        # 单GPU环境：使用配置的worker数
+        NUM_WORKERS = base_workers
+        logger.info("single_gpu_config", num_workers=NUM_WORKERS)
 
     async with httpx.AsyncClient(timeout=60, limits=CLIENT_LIMITS) as client:
         # 同步注册
@@ -695,10 +828,31 @@ async def main_loop():
                     break
 
                 task_id = task_overview.get("task_id")
-                target_sla = task_overview.get("target_sla")
+                target_sla = task_overview.get("target_sla", "standard")
                 target_reward = task_overview.get("target_reward", 1.0)
                 deadline_ms = task_overview.get("deadline_ms")
 
+                # ── Deadline感知: 提前拒绝必定超时的任务 ──
+                # 构造临时task对象用于估算
+                temp_task = {"overview": task_overview, "messages": task_overview.get("messages", [])}
+
+                # 判断是否可以完成
+                if not estimate_task_feasible(temp_task, target_sla):
+                    est_duration = estimate_task_duration(temp_task, target_sla)
+                    remaining = (deadline_ms / 1000.0) if deadline_ms else float('inf')
+                    logger.info(
+                        "task_rejected_predicted_timeout",
+                        task_id=task_id,
+                        est_duration=est_duration,
+                        remaining=remaining,
+                        reward=target_reward,
+                    )
+                    metrics.inc_counter("client.tasks.rejected_timeout_predicted")
+                    # 尝试调用拒绝API（如果平台支持）
+                    await reject_task(client, task_id, backoff, reason="timeout_predicted")
+                    continue  # 跳过此任务，继续下一个
+
+                # 正常接受任务
                 task = await accept_task(client, task_id, target_sla, backoff)
                 if task is None:
                     break

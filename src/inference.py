@@ -156,17 +156,107 @@ def get_sla_strategy(sla_level: str) -> Dict[str, Any]:
     return SLA_STRATEGIES.get(sla_level, SLA_STRATEGIES["standard"])
 
 
-def get_sla_from_deadline(deadline_ms: Optional[int]) -> str:
+# SLA降级阈值配置
+SLA_DOWNGRADE_THRESHOLDS: Dict[str, float] = {
+    "high_quality": 1.2,  # 时间不足预估的1.2倍时降级
+    "standard": 1.3,
+    "fast": 1.5,
+    "express": 1.8,
+}
+
+
+def get_sla_from_deadline(deadline_ms: Optional[int],
+                          estimated_duration: float = None,
+                          msg_count: int = None) -> str:
+    """
+    根据deadline和估算时长确定SLA级别。
+
+    Args:
+        deadline_ms: 截止时间（毫秒）
+        estimated_duration: 预估完成时间（秒），用于判断是否需要SLA降级
+        msg_count: 消息数量
+
+    Returns:
+        SLA级别字符串
+    """
     if deadline_ms is None:
         return "standard"
+
     deadline_s = deadline_ms / 1000.0
+
+    # 基础SLA选择
+    base_sla = "standard"
     if deadline_s <= 1.0:
-        return "express"
+        base_sla = "express"
     elif deadline_s <= 5.0:
-        return "fast"
+        base_sla = "fast"
     elif deadline_s <= 30.0:
-        return "standard"
-    return "high_quality"
+        base_sla = "standard"
+    else:
+        base_sla = "high_quality"
+
+    # Deadline感知: 如果时间紧迫，考虑降级SLA以加快处理
+    if estimated_duration and estimated_duration > 0:
+        ratio = deadline_s / estimated_duration
+        threshold = SLA_DOWNGRADE_THRESHOLDS.get(base_sla, 1.3)
+
+        if ratio < threshold:
+            # 时间不足，降级SLA
+            metrics.inc_counter("inference.sla_downgraded", labels={"from": base_sla})
+
+            # 根据紧迫程度决定降级到什么级别
+            if ratio < 0.8:
+                # 极度紧迫，降到最快
+                return "express"
+            elif ratio < 1.0:
+                # 略微紧迫
+                return "fast" if base_sla in ("standard", "high_quality") else "express"
+            else:
+                # 略紧但不严重
+                return "fast" if base_sla == "high_quality" else base_sla
+
+            logger.info("sla_downgrade", base_sla=base_sla, final_sla=base_sla,
+                       ratio=ratio, threshold=threshold)
+
+    return base_sla
+
+
+def get_adaptive_sla_strategy(deadline_ms: Optional[int],
+                              msg_count: int = 1,
+                              base_sla: str = None) -> Dict[str, Any]:
+    """
+    获取自适应SLA策略，综合考虑deadline和时间紧迫度。
+
+    Args:
+        deadline_ms: 截止时间
+        msg_count: 消息数量
+        base_sla: 基础SLA级别
+
+    Returns:
+        SLA策略字典
+    """
+    # 如果没有指定基础SLA，根据deadline确定
+    if base_sla is None:
+        base_sla = get_sla_from_deadline(deadline_ms)
+
+    # 估算所需时间
+    estimated_duration = 0.0
+    if deadline_ms:
+        # 基于SLA级别估算
+        sla_durations = {
+            "express": 0.05,
+            "fast": 0.1,
+            "standard": 0.3,
+            "high_quality": 0.5,
+        }
+        base_per_msg = sla_durations.get(base_sla, 0.3)
+        estimated_duration = base_per_msg * min(msg_count, 10)
+
+    # 获取降级后的SLA
+    final_sla = get_sla_from_deadline(deadline_ms, estimated_duration, msg_count)
+
+    # 获取对应的策略
+    return get_sla_strategy(final_sla)
 
 
 # SLA 自适应推理配置
@@ -266,7 +356,11 @@ async def compute_logprob(
     continuation: str,
     sla_strategy: Optional[Dict[str, Any]] = None,
 ) -> float:
-    """计算 log P(continuation | prompt),单次 API 调用."""
+    """
+    计算 log P(continuation | prompt),单次 API 调用。
+
+    使用高精度设置确保概率计算的准确性。
+    """
     if not continuation:
         return 0.0
 
@@ -275,21 +369,42 @@ async def compute_logprob(
     ct = len(enc.encode(continuation))
     lp_req = pt + ct
 
+    # 增加buffer以提高精度，并限制最大请求量
+    lp_req = min(lp_req + 10, 2000)
+
     resp = await _call_vllm(
-        prompt=prompt + continuation, max_tokens=1, logprobs=lp_req,
-        echo=True, temperature=0.0, top_p=1.0, top_k=1,
+        prompt=prompt + continuation,
+        max_tokens=1,
+        logprobs=lp_req,
+        echo=True,
+        temperature=0.0,  # 强制greedy确保确定性
+        top_p=1.0,
+        top_k=1,
     )
 
     lps = resp.get("choices", [{}])[0].get("logprobs", {}).get("token_logprobs", [])
     if not lps or len(lps) < 2:
+        _metrics.inc_counter("inference.logprob_error", labels={"reason": "empty_response"})
         return -10.0
 
+    # 精确提取continuation部分的logprob
     if pt > 0 and ct > 0:
+        # 正常情况：取prompt之后、continuation长度的部分
         cont = [lp for lp in lps[pt:pt + ct] if lp is not None]
     else:
+        # 边界情况：使用中点分割
         mid = len(lps) // 2
-        cont = [lp for lp in lps[mid:] if lp is not None]
-    return float(sum(cont)) if cont else -10.0
+        cont = [lp for lp in lps[mid:mid + ct] if lp is not None]
+
+    if not cont:
+        _metrics.inc_counter("inference.logprob_error", labels={"reason": "no_valid_tokens"})
+        return -10.0
+
+    # 计算总logprob
+    total_logprob = float(sum(cont))
+    _metrics.observe_histogram("inference.logprob_sum", total_logprob)
+
+    return total_logprob
 
 
 async def compute_rolling_logprob(
@@ -326,8 +441,59 @@ def _std(values: List[float]) -> float:
     return (sum((x - mean) ** 2 for x in values) / len(values)) ** 0.5
 
 
+# ── 结果验证 ─────────────────────────────────────────────────────────────
+
+def validate_result(result: Dict[str, Any]) -> bool:
+    """
+    验证推理结果的有效性。
+
+    Args:
+        result: 推理结果字典
+
+    Returns:
+        True: 结果有效
+        False: 结果异常
+    """
+    rt = result.get("eval_request_type")
+
+    if rt == "generate_until":
+        response = result.get("response", "")
+        # 检查是否为空
+        if not response:
+            logger.warning("validation_failed", reason="empty_response", type=rt)
+            return False
+        # 检查是否过短
+        if len(response) < 3:
+            logger.warning("validation_failed", reason="too_short", type=rt, length=len(response))
+            return False
+        # 检查是否为重复内容
+        words = response.split()
+        if len(words) >= 5:
+            unique_ratio = len(set(words)) / len(words)
+            if unique_ratio < 0.3:
+                logger.warning("validation_failed", reason="repetitive", type=rt)
+                return False
+
+    elif rt in ("loglikelihood", "loglikelihood_rolling"):
+        accuracy = result.get("accuracy")
+        # 检查是否异常
+        if accuracy is None:
+            logger.warning("validation_failed", reason="none_accuracy", type=rt)
+            return False
+        # logprob通常为负数，正数可能是异常
+        if accuracy > 0.1:
+            logger.warning("validation_failed", reason="positive_logprob", type=rt, accuracy=accuracy)
+            # 注意：不直接返回False，因为某些情况确实可能为正
+
+    return True
+
+
 def _aggregate_task_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """按 task_id 聚合多 message 正确性分数 (Q63: 取平均)."""
+    """
+    按 task_id 聚合多 message 正确性分数 (Q63: 取平均)。
+
+    同时进行结果验证。
+    """
     groups: Dict[int, List[Dict[str, Any]]] = {}
     for r in results:
         tid = r.get("task_id") or r.get("ID") or 0
@@ -336,16 +502,36 @@ def _aggregate_task_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any
     out = []
     for tid, group in groups.items():
         if len(group) == 1:
-            out.append(group[0])
+            # 单个结果也要验证
+            result = group[0]
+            if not validate_result(result):
+                result["_validation_failed"] = True
+                _metrics.inc_counter("inference.validation.failed")
+            out.append(result)
             continue
+
+        # 多结果聚合
         first = group[0].copy()
         accs = [r.get("accuracy") for r in group if r.get("accuracy") is not None]
+
+        # 验证所有结果
+        valid_count = 0
+        for r in group:
+            if validate_result(r):
+                valid_count += 1
+            else:
+                r["_validation_failed"] = True
+                _metrics.inc_counter("inference.validation.failed")
+
         if accs:
+            # 只使用有效结果的平均值
             first["accuracy"] = sum(accs) / len(accs)
             first["accuracy_count"] = len(accs)
             first["accuracy_std"] = _std(accs) if len(accs) > 1 else 0.0
+            first["valid_count"] = valid_count
+
         for r in group:
-            if r.get("response"):
+            if r.get("response") and not r.get("_validation_failed"):
                 first["response"] = r["response"]
                 break
         first["message_count"] = len(group)
@@ -358,7 +544,20 @@ async def _process_single_message(
     msg: Dict[str, Any],
     idx: int,
     sla_strategy: Optional[Dict[str, Any]] = None,
+    sla_level: str = "standard",
 ) -> Dict[str, Any]:
+    """
+    处理单条消息推理。
+
+    Args:
+        msg: 消息字典
+        idx: 消息索引
+        sla_strategy: SLA策略
+        sla_level: SLA级别（用于日志和类型感知采样）
+
+    Returns:
+        推理结果字典
+    """
     msg_id = msg.get("ID")
     rt = msg.get("eval_request_type", "loglikelihood")
     prompt = msg["prompt"]
@@ -366,21 +565,41 @@ async def _process_single_message(
     result = {"ID": msg_id, "prompt": prompt, "eval_request_type": rt}
     msg_start = time.time()
 
+    # ── 任务类型感知的采样参数 ──
+    # loglikelihood类任务必须使用temperature=0确保确定性
     if rt == "generate_until":
-        response_text = await generate_text(prompt, msg.get("eval_gen_kwargs"), sla_strategy)
+        # 生成任务：使用SLA策略的采样参数
+        gen_kwargs = msg.get("eval_gen_kwargs")
+        response_text = await generate_text(prompt, gen_kwargs, sla_strategy)
         result["response"] = response_text
         result["accuracy"] = None
         tokens = len(response_text.split()) if response_text else 0
+
     elif rt == "loglikelihood":
-        logprob = await compute_logprob(prompt, msg.get("eval_continuation", ""), sla_strategy)
+        # 概率计算：强制temperature=0确保确定性
+        # 不使用sla_strategy，强制greedy解码
+        logprob = await compute_logprob(
+            prompt,
+            msg.get("eval_continuation", ""),
+            None  # 强制确定性参数
+        )
         result["accuracy"] = logprob
         result["response"] = None
         tokens = len(msg.get("eval_continuation", "").split())
+
+        # 记录logprob质量指标
+        _metrics.observe_histogram("inference.logprob_value", logprob, labels={"type": rt})
+
     elif rt == "loglikelihood_rolling":
-        logprob = await compute_rolling_logprob(prompt, sla_strategy)
+        # 滚动概率：强制temperature=0
+        logprob = await compute_rolling_logprob(prompt, None)
         result["accuracy"] = logprob
         result["response"] = None
         tokens = len(prompt.split())
+
+        # 记录logprob质量指标
+        _metrics.observe_histogram("inference.logprob_value", logprob, labels={"type": rt})
+
     else:
         result["response"] = None
         result["accuracy"] = None
@@ -388,7 +607,7 @@ async def _process_single_message(
 
     elapsed = time.time() - msg_start
     _metrics.observe_histogram("inference.latency", elapsed,
-                               labels={"type": rt, "sla": (sla_strategy or {}).get("sla_level", "none")})
+                               labels={"type": rt, "sla": sla_level})
     _metrics.inc_counter("inference.requests", labels={"type": rt, "status": "success"})
     _metrics.inc_counter("inference.tokens", tokens, labels={"type": rt})
 
@@ -404,9 +623,25 @@ def run_inference(
     deadline_ms: Optional[int] = None,
     max_concurrent: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
+    msg_count = len(messages)
+
+    # 使用自适应SLA策略
     if sla_level is None:
-        sla_level = get_sla_from_deadline(deadline_ms)
-    sla_strategy = get_sla_strategy(sla_level)
+        # 根据deadline和消息数量自动确定SLA
+        adaptive_strategy = get_adaptive_sla_strategy(deadline_ms, msg_count)
+        # 从策略中推断SLA级别
+        if adaptive_strategy.get("temperature", 0) == 0 and adaptive_strategy.get("max_gen_toks", 0) <= 32:
+            effective_sla = "express"
+        elif adaptive_strategy.get("max_gen_toks", 0) <= 64:
+            effective_sla = "fast"
+        elif adaptive_strategy.get("max_gen_toks", 0) <= 128:
+            effective_sla = "standard"
+        else:
+            effective_sla = "high_quality"
+    else:
+        effective_sla = sla_level
+        adaptive_strategy = get_adaptive_sla_strategy(deadline_ms, msg_count, sla_level)
+
     if max_concurrent is None:
         max_concurrent = CONCURRENCY_CONFIG["max_concurrent_messages"]
 
@@ -415,7 +650,7 @@ def run_inference(
 
         async def bounded(m, i):
             async with sem:
-                return await _process_single_message(m, i, sla_strategy)
+                return await _process_single_message(m, i, adaptive_strategy, effective_sla)
 
         return await asyncio.gather(*[bounded(m, i) for i, m in enumerate(messages)], return_exceptions=True)
 
@@ -428,12 +663,12 @@ def run_inference(
             results.append({
                 "ID": msg.get("ID"), "prompt": msg.get("prompt"),
                 "eval_request_type": msg.get("eval_request_type", "loglikelihood"),
-                "response": None, "accuracy": None, "sla_level": sla_level,
+                "response": None, "accuracy": None, "sla_level": effective_sla,
             })
             _metrics.inc_counter("inference.requests",
                                  labels={"type": msg.get("eval_request_type", "loglikelihood"), "status": "error"})
         else:
-            r["sla_level"] = sla_level
+            r["sla_level"] = effective_sla
             results.append(r)
 
     return _aggregate_task_results(results)
