@@ -25,6 +25,7 @@ venv/
 ENV/
 env/
 .venv/
+quant/
 
 # IDE
 .idea/
@@ -65,3 +66,4 @@ Thumbs.db
 *.tmp
 *.temp
 *.bak
+
