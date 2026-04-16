@@ -34,14 +34,12 @@ from src.inference import load_config, METRICS, close_vllm_client, warmup_model
 _vllm_proc = None
 _shutdown_requested = False
 
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+
 
 # ── 配置验证 ─────────────────────────────────────────────────────────────
 
 def validate_config():
-    """
-    验证配置是否正确。
-    在启动前检查关键参数。
-    """
     errors = []
 
     # TOKEN 验证
@@ -179,8 +177,8 @@ def start_vllm_background():
         "--gpu-memory-utilization", "0.9",
         # 性能优化参数
         "--max-model-len", "8192",  # 限制上下文长度以节省显存
-        "--disable-log-requests",  # 减少日志开销
         "--enable-prefix-caching",  # 前缀缓存,减少重复计算
+        "--no-enable-log-requests",  # 减少日志开销
     ]
 
     # speculative decoding 支持 (Q33: 允许使用小模型进行投机解码)

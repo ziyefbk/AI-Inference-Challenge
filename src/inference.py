@@ -30,7 +30,7 @@ setup_logger(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = get_logger("inference")
 
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8000")
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen3-32B")
+MODEL_NAME = os.environ.get("MODEL_PATH", "Qwen3-32B")
 
 _vllm_async_client: Optional[httpx.AsyncClient] = None
 

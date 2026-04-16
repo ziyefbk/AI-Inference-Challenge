@@ -19,6 +19,7 @@ import time
 import json
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
+import requests
 
 # 将 src 目录加入 Python 路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,7 +33,7 @@ from src.utils.graceful import shutdown_manager
 from src.inference import run_inference
 
 
-PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://10.0.0.1:8003")
+PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://127.0.0.1:8003")
 TOKEN = os.environ.get("TEAM_TOKEN", "")
 TEAM_NAME = os.environ.get("TEAM_NAME", "contestant")
 CONTESTANT_PORT = int(os.environ.get("CONTESTANT_PORT", "9000"))
@@ -375,24 +376,19 @@ def load_checkpoint() -> Optional[Dict[str, Any]]:
         return None
 
 
-async def register(client: httpx.AsyncClient) -> bool:
-    """向平台注册。"""
+def register() -> bool:
+    """同步注册。"""
     try:
-        resp = await client.post(
+        resp = requests.post(
             f"{PLATFORM_URL}/register",
             json={"name": TEAM_NAME, "token": TOKEN},
+            timeout=30,
         )
-        if resp.status_code == 200:
-            logger.info("registration_success", team=TEAM_NAME)
-            metrics.inc_counter("client.registration.success")
-            return True
-        else:
-            logger.error("registration_failed", status=resp.status_code, response=resp.text)
-            metrics.inc_counter("client.registration.failure")
-            return False
+        resp.raise_for_status()
+        logger.info("registration_success", team=TEAM_NAME)
+        return True
     except Exception as e:
         logger.exception("registration_error", error=str(e))
-        metrics.inc_counter("client.registration.error")
         return False
 
 
@@ -627,8 +623,8 @@ async def main_loop():
     PREFETCH_SIZE = int(os.environ.get("PREFETCH_SIZE", "8"))
 
     async with httpx.AsyncClient(timeout=60, limits=CLIENT_LIMITS) as client:
-        # 注册
-        if not await register(client):
+        # 同步注册
+        if not register():
             logger.error("registration_failed")
             return
 
