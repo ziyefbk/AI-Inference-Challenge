@@ -744,12 +744,11 @@ async def main_loop():
     rate_limiter = RateLimiter(max_rate=MAX_QUERY_RATE, burst=MAX_QUERY_RATE)
     task_holder = PriorityTaskHolder(max_held=MAX_HELD_TASKS, timeout_s=TASK_ACCEPT_TIMEOUT)
 
-    # ── 动态Worker数量配置 ──
-    # 根据GPU数量自动调整worker数量
+    # ── 动态配置：根据 GPU 数量自动调整参数 ──
     base_workers = int(os.environ.get("NUM_WORKERS", "3"))
-    PREFETCH_SIZE = int(os.environ.get("PREFETCH_SIZE", "8"))
+    base_prefetch = int(os.environ.get("PREFETCH_SIZE", "8"))
 
-    # 检测GPU数量
+    # 检测 GPU 数量
     num_gpus = 1
     try:
         result = subprocess.run(
@@ -761,15 +760,20 @@ async def main_loop():
     except Exception:
         pass
 
-    # 根据GPU数量调整worker
+    # 根据 GPU 数量调整并发参数
     if num_gpus > 1:
-        # 多GPU环境：增加worker数量
-        NUM_WORKERS = min(base_workers + num_gpus, 12)  # 最多12个worker
-        logger.info("multi_gpu_config", num_gpus=num_gpus, num_workers=NUM_WORKERS)
+        # 多 GPU 环境：增加 worker 数量和预取大小
+        NUM_WORKERS = min(base_workers + num_gpus, 20)  # 最多 20 个 worker
+        PREFETCH_SIZE = base_prefetch * 2  # 预取翻倍
+        # 通知 inference.py 使用多实例
+        os.environ["VLLM_NUM_INSTANCES"] = str(num_gpus)
+        logger.info("multi_gpu_config", num_gpus=num_gpus, num_workers=NUM_WORKERS, prefetch_size=PREFETCH_SIZE)
     else:
-        # 单GPU环境：使用配置的worker数
+        # 单 GPU 环境：使用配置的参数
         NUM_WORKERS = base_workers
-        logger.info("single_gpu_config", num_workers=NUM_WORKERS)
+        PREFETCH_SIZE = base_prefetch
+        os.environ["VLLM_NUM_INSTANCES"] = "1"
+        logger.info("single_gpu_config", num_workers=NUM_WORKERS, prefetch_size=PREFETCH_SIZE)
 
     async with httpx.AsyncClient(timeout=60, limits=CLIENT_LIMITS) as client:
         # 同步注册

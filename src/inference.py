@@ -19,6 +19,7 @@ import time
 import logging
 import asyncio
 import random
+import threading
 from typing import Optional, Dict, Any, List
 from functools import lru_cache
 import tiktoken
@@ -29,10 +30,55 @@ from src.utils.logger import setup_logger, get_logger
 setup_logger(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = get_logger("inference")
 
-VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8000")
+# ── 多实例 vLLM 配置 ──────────────────────────────────────────────────────
+# 启动时自动检测 GPU 数量设置，或通过环境变量覆盖
+_VLLM_NUM_INSTANCES = int(os.environ.get("VLLM_NUM_INSTANCES", "1"))
+
+def _build_vllm_urls() -> List[str]:
+    """构建所有 vLLM 实例的 URL 列表。"""
+    if "VLLM_URLS" in os.environ:
+        return [u.strip() for u in os.environ["VLLM_URLS"].split(",") if u.strip()]
+    n = _VLLM_NUM_INSTANCES
+    return [f"http://localhost:{8000 + i}" for i in range(n)]
+
+VLLM_URLS = _build_vllm_urls()
+VLLM_URL = VLLM_URLS[0]  # 兼容单实例场景
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen3-32B")
 
-_vllm_async_client: Optional[httpx.AsyncClient] = None
+# ── 客户端池（每实例一个独立客户端） ──────────────────────────────────────
+_vllm_async_clients: Dict[str, httpx.AsyncClient] = {}
+_client_lock = threading.Lock()
+_url_index = 0  # 轮询索引（线程安全）
+
+
+def _get_next_url() -> str:
+    """轮询获取下一个 vLLM 实例 URL。"""
+    global _url_index
+    return VLLM_URLS[_url_index % len(VLLM_URLS)]
+
+
+async def _get_vllm_async_client(url: str) -> httpx.AsyncClient:
+    """获取指定 URL 的异步客户端（懒加载单例）。"""
+    with _client_lock:
+        if url not in _vllm_async_clients:
+            _vllm_async_clients[url] = httpx.AsyncClient(
+                timeout=httpx.Timeout(RETRY_CONFIG["request_timeout"]),
+                limits=httpx.Limits(
+                    max_keepalive_connections=int(os.environ.get("VLLM_MAX_KEEPALIVE", "20")),
+                    max_connections=int(os.environ.get("VLLM_MAX_CONNECTIONS", "50")),
+                ),
+            )
+        return _vllm_async_clients[url]
+
+
+async def _close_all_clients():
+    """关闭所有客户端。"""
+    global _vllm_async_clients
+    with _client_lock:
+        for url, client in _vllm_async_clients.items():
+            await client.aclose()
+        _vllm_async_clients.clear()
+
 
 RETRY_CONFIG = {
     "max_retries": int(os.environ.get("VLLM_MAX_RETRIES", "3")),
@@ -41,29 +87,26 @@ RETRY_CONFIG = {
     "request_timeout": float(os.environ.get("VLLM_TIMEOUT", "120.0")),
 }
 
+# ── 并发配置：多实例自适应 ────────────────────────────────────────────────
+_base_concurrent = int(os.environ.get("MAX_CONCURRENT_MESSAGES", "20"))
+_num_instances = _VLLM_NUM_INSTANCES
+
+# 每实例并发 * 实例数 = 总并发上限（避免过高）
 CONCURRENCY_CONFIG = {
-    "max_concurrent_messages": int(os.environ.get("MAX_CONCURRENT_MESSAGES", "20")),
+    "max_concurrent_messages": _base_concurrent * _num_instances,
     "warmup_enabled": os.environ.get("WARMUP_ENABLED", "true").lower() == "true",
     "warmup_requests": int(os.environ.get("WARMUP_REQUESTS", "5")),
 }
+
+logger.info("vllm_config",
+            num_instances=_num_instances,
+            urls=VLLM_URLS,
+            max_concurrent=CONCURRENCY_CONFIG["max_concurrent_messages"])
 
 
 @lru_cache(maxsize=4)
 def _get_tiktoken_encoding(encoding_name: str = "cl100k_base"):
     return tiktoken.get_encoding(encoding_name)
-
-
-async def _get_vllm_async_client() -> httpx.AsyncClient:
-    global _vllm_async_client
-    if _vllm_async_client is None:
-        _vllm_async_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(RETRY_CONFIG["request_timeout"]),
-            limits=httpx.Limits(
-                max_keepalive_connections=int(os.environ.get("VLLM_MAX_KEEPALIVE", "20")),
-                max_connections=int(os.environ.get("VLLM_MAX_CONNECTIONS", "50")),
-            ),
-        )
-    return _vllm_async_client
 
 
 async def _call_vllm(
@@ -82,7 +125,7 @@ async def _call_vllm(
     max_model_len: Optional[int] = None,
     beam_size: int = 1,
 ) -> Dict[str, Any]:
-    """异步调用 vLLM chat API,自动重试."""
+    """异步调用 vLLM chat API，自动重试，轮询分发到多实例。"""
     payload = {
         "model": MODEL_NAME,
         "messages": [
@@ -107,10 +150,15 @@ async def _call_vllm(
     if repetition_penalty != 1.0:
         payload["repetition_penalty"] = repetition_penalty
 
-    client = await _get_vllm_async_client()
+    # 轮询选择 vLLM 实例
+    global _url_index
+    chosen_url = VLLM_URLS[_url_index % len(VLLM_URLS)]
+    _url_index += 1
+
+    client = await _get_vllm_async_client(chosen_url)
     for attempt in range(RETRY_CONFIG["max_retries"] + 1):
         try:
-            resp = await client.post(f"{VLLM_URL}/v1/chat/completions", json=payload)
+            resp = await client.post(f"{chosen_url}/v1/chat/completions", json=payload)
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as e:
@@ -743,18 +791,13 @@ async def run_inference_async(
 
 async def _close_async_client():
     """关闭全局异步客户端。"""
-    global _vllm_async_client
-    if _vllm_async_client is not None:
-        await _vllm_async_client.aclose()
-        _vllm_async_client = None
+    await _close_all_clients()
 
 
 def close_vllm_client():
     """同步关闭 vLLM 客户端（供 main.py 调用）。"""
-    global _vllm_async_client
-    if _vllm_async_client is not None:
-        try:
-            asyncio.run(_close_async_client())
-        except RuntimeError:
-            # Event loop 已关闭，忽略
-            _vllm_async_client = None
+    try:
+        asyncio.run(_close_async_client())
+    except RuntimeError:
+        # Event loop 已关闭，忽略
+        pass

@@ -31,7 +31,7 @@ from src.client import main_loop
 from src.inference import load_config, METRICS, close_vllm_client, warmup_model
 
 # 全局变量
-_vllm_proc = None
+_vllm_procs: list = []
 _shutdown_requested = False
 
 os.environ.setdefault('OMP_NUM_THREADS', '1')
@@ -104,32 +104,25 @@ def setup_signal_handlers():
 # ── vLLM 进程管理 ───────────────────────────────────────────────────────
 
 def cleanup_vllm():
-    """清理 vLLM 进程及其子进程。"""
-    global _vllm_proc
-    if _vllm_proc is None:
-        return
-
-    try:
-        # 使用进程组杀死整个进程树
-        if hasattr(os, "killpg"):
-            try:
-                os.killpg(os.getpgid(_vllm_proc.pid), signal.SIGTERM)
-                print("[Main] vLLM 进程组已终止")
-            except ProcessLookupError:
-                pass
-        else:
-            _vllm_proc.terminate()
-
-        # 等待进程结束
+    """清理所有 vLLM 进程及其子进程。"""
+    global _vllm_procs
+    for proc in _vllm_procs:
         try:
-            _vllm_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _vllm_proc.kill()
-            print("[Main] vLLM 进程已强制杀死")
-    except Exception as e:
-        print(f"[Main] 清理 vLLM 进程失败: {e}")
-    finally:
-        _vllm_proc = None
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            else:
+                proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except Exception as e:
+            print(f"[Main] 清理 vLLM 进程失败: {e}")
+    _vllm_procs = []
+    print("[Main] vLLM 进程组已终止")
 
 
 def start_http_server(port: int):
@@ -141,15 +134,14 @@ def start_http_server(port: int):
 
 def start_vllm_background():
     """
-    后台启动 vLLM 推理引擎并等待其就绪。
-    返回子进程对象。
+    后台启动一个或多个 vLLM 推理引擎并等待其就绪。
+    返回子进程列表。
     """
-    global _vllm_proc
+    global _vllm_procs
 
     MODEL_PATH = os.environ.get("MODEL_PATH", "/root/autodl-tmp/models/Qwen2.5-0.5B")
-    VLLM_PORT = int(os.environ.get("VLLM_PORT", "8000"))
 
-    # 检测 GPU 数量,用于 tensor parallelism
+    # 检测 GPU 数量
     num_gpus = 1
     try:
         result = subprocess.run(
@@ -169,86 +161,87 @@ def start_vllm_background():
     else:
         PYTHON_BIN = "python3"
 
-    # vLLM 启动命令,包含优化参数
-    vllm_cmd = [
-        PYTHON_BIN, "-m", "vllm.entrypoints.openai.api_server",
-        "--model", MODEL_PATH,
-        "--port", str(VLLM_PORT),
-        "--gpu-memory-utilization", "0.9",
-        # # 性能优化参数
-        # "--max-model-len", "8192",  # 限制上下文长度以节省显存
-        # "--enable-prefix-caching",  # 前缀缓存,减少重复计算
-        # "--disable-log-requests",   # 减少日志开销
-    ]
+    # 确定实例数量：每个 GPU 一个实例
+    num_instances = max(1, num_gpus)
+    print(f"[Main] 检测到 {num_gpus} 张 GPU, 启动 {num_instances} 个 vLLM 实例")
 
     # speculative decoding 支持 (Q33: 允许使用小模型进行投机解码)
     SPECULATIVE_MODEL = os.environ.get("SPECULATIVE_MODEL", "")
-    if SPECULATIVE_MODEL:
-        vllm_cmd.extend([
-            "--speculative-model", SPECULATIVE_MODEL,
-            "--num-speculative-tokens", os.environ.get("SPECULATIVE_DRAFT_TOKENS", "4"),
-        ])
-        print(f"[Main] 启用投机解码: {SPECULATIVE_MODEL}")
 
-    # 多 GPU 时启用 tensor parallelism
-    if num_gpus > 1:
-        tp_size = min(num_gpus, 2)  # Qwen3-32B 最多用 2 卡
-        vllm_cmd.extend(["--tensor-parallel-size", str(tp_size)])
-        print(f"[Main] 使用 tensor parallelism, {tp_size} 张 GPU")
+    # 为每个实例创建启动参数
+    all_procs = []
+    for i in range(num_instances):
+        port = 8000 + i
+        gpu_id = i if i < num_gpus else 0
 
-    print(f"[Main] 启动 vLLM: {' '.join(vllm_cmd)}")
+        vllm_cmd = [
+            PYTHON_BIN, "-m", "vllm.entrypoints.openai.api_server",
+            "--model", MODEL_PATH,
+            "--port", str(port),
+            "--gpu-memory-utilization", "0.9",
+            "--tensor-parallel-size", "1",
+        ]
 
-    # 创建新进程组
-    proc = subprocess.Popen(
-        vllm_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        preexec_fn=os.setsid if hasattr(os, "setsid") else None,
-    )
-    _vllm_proc = proc
+        if SPECULATIVE_MODEL:
+            vllm_cmd.extend([
+                "--speculative-model", SPECULATIVE_MODEL,
+                "--num-speculative-tokens", os.environ.get("SPECULATIVE_DRAFT_TOKENS", "4"),
+            ])
+            print(f"[Main] 实例 {i} 启用投机解码: {SPECULATIVE_MODEL}")
 
-    # 等待 vLLM 就绪,最多 55 秒
-    vllm_url = f"http://localhost:{VLLM_PORT}"
+        print(f"[Main] 启动 vLLM 实例 {i}: {' '.join(vllm_cmd)}")
+
+        proc = subprocess.Popen(
+            vllm_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            preexec_fn=os.setsid if hasattr(os, "setsid") else None,
+        )
+        all_procs.append((i, port, proc))
+
+    _vllm_procs = all_procs
+
+    # 等待所有 vLLM 实例就绪
     start_time = time.time()
-    check_interval = 1.0  # 开始时快速检查,每秒一次
-    max_wait = 55  # 留出 buffer 给 HTTP 服务器启动
+    max_wait = 55
+    print(f"[Main] 等待 vLLM 实例就绪 (最多 {max_wait}s)...")
 
-    print(f"[Main] 等待 vLLM 就绪 (最多 {max_wait}s)...")
-    for i in range(100):  # 最多迭代次数
-        elapsed = time.time() - start_time
-        if elapsed >= max_wait:
-            print(f"[Main] 警告: vLLM 在 {max_wait}s 内未就绪,继续运行")
-            return proc
+    ready_count = 0
+    for i, port, proc in all_procs:
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed >= max_wait:
+                print(f"[Main] 警告: vLLM 实例 {i} 在 {max_wait}s 内未就绪,继续运行")
+                break
 
-        # 检查进程是否退出
-        if proc.poll() is not None:
-            stdout, stderr = proc.communicate()
-            print(f"[Main] vLLM 进程异常退出: {proc.returncode}")
-            if stdout:
-                print(f"[Main] stdout: {stdout.decode()[:500]}")
-            if stderr:
-                print(f"[Main] stderr: {stderr.decode()[:500]}")
-            return None
+            if proc.poll() is not None:
+                stdout, stderr = proc.communicate()
+                print(f"[Main] vLLM 实例 {i} 进程异常退出: {proc.returncode}")
+                if stdout:
+                    print(f"[Main] stdout: {stdout.decode()[:500]}")
+                if stderr:
+                    print(f"[Main] stderr: {stderr.decode()[:500]}")
+                break
 
-        try:
-            resp = httpx.get(f"{vllm_url}/v1/models", timeout=2)
-            if resp.status_code == 200:
-                print(f"[Main] vLLM 引擎就绪,耗时 {elapsed:.1f}s")
-                return proc
-        except Exception:
-            pass
+            try:
+                resp = httpx.get(f"http://localhost:{port}/v1/models", timeout=2)
+                if resp.status_code == 200:
+                    print(f"[Main] vLLM 实例 {i} 就绪 (端口 {port}), 耗时 {elapsed:.1f}s")
+                    ready_count += 1
+                    break
+            except Exception:
+                pass
 
-        # 自适应 sleep: 快超时时间隔更短
-        remaining = max_wait - elapsed
-        if remaining > 30:
-            time.sleep(check_interval)
-        elif remaining > 10:
-            time.sleep(0.5)
-        else:
-            time.sleep(0.2)
+            remaining = max_wait - elapsed
+            if remaining > 30:
+                time.sleep(1.0)
+            elif remaining > 10:
+                time.sleep(0.5)
+            else:
+                time.sleep(0.2)
 
-    print("[Main] 警告: vLLM 未及时就绪,继续运行")
-    return proc
+    print(f"[Main] {ready_count}/{num_instances} 个 vLLM 实例已就绪")
+    return all_procs
 
 
 # ── HTTP 服务器 (端口 9000) ────────────────────────────────────────────────
@@ -308,13 +301,18 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"status": "not_ready", "vllm": "error"}')
 
     def _check_vllm(self) -> bool:
-        """检查 vLLM 是否可用。"""
-        VLLM_PORT = int(os.environ.get("VLLM_PORT", "8000"))
-        try:
-            resp = httpx.get(f"http://localhost:{VLLM_PORT}/v1/models", timeout=2)
-            return resp.status_code == 200
-        except Exception:
-            return False
+        """检查所有 vLLM 实例是否至少有一个可用。"""
+        # 支持多实例检查
+        num_instances = int(os.environ.get("VLLM_NUM_INSTANCES", "1"))
+        for i in range(num_instances):
+            port = 8000 + i
+            try:
+                resp = httpx.get(f"http://localhost:{port}/v1/models", timeout=2)
+                if resp.status_code == 200:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _handle_metrics(self):
         """Prometheus 格式的指标。"""
@@ -371,9 +369,9 @@ def main():
 
     # 启动 vLLM (除非使用 --no-vllm 跳过)
     if not args.no_vllm:
-        proc = start_vllm_background()
+        procs = start_vllm_background()
         # 等待 vLLM 就绪后预热模型
-        if proc:
+        if procs:
             print("[Main] 正在预热模型 (构建 CUDA Graph)...")
             warmup_model()
     else:
