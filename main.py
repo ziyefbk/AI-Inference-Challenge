@@ -146,7 +146,7 @@ def start_vllm_background():
     """
     global _vllm_proc
 
-    MODEL_PATH = os.environ.get("MODEL_PATH", "/mnt/model/Qwen3-32B")
+    MODEL_PATH = os.environ.get("MODEL_PATH", "/root/autodl-tmp/models/Qwen2.5-0.5B")
     VLLM_PORT = int(os.environ.get("VLLM_PORT", "8000"))
 
     # 检测 GPU 数量,用于 tensor parallelism
@@ -175,10 +175,10 @@ def start_vllm_background():
         "--model", MODEL_PATH,
         "--port", str(VLLM_PORT),
         "--gpu-memory-utilization", "0.9",
-        # 性能优化参数
-        "--max-model-len", "8192",  # 限制上下文长度以节省显存
-        "--enable-prefix-caching",  # 前缀缓存,减少重复计算
-        "--no-enable-log-requests",  # 减少日志开销
+        # # 性能优化参数
+        # "--max-model-len", "8192",  # 限制上下文长度以节省显存
+        # "--enable-prefix-caching",  # 前缀缓存,减少重复计算
+        # "--disable-log-requests",   # 减少日志开销
     ]
 
     # speculative decoding 支持 (Q33: 允许使用小模型进行投机解码)

@@ -30,7 +30,7 @@ setup_logger(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = get_logger("inference")
 
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8000")
-MODEL_NAME = os.environ.get("MODEL_PATH", "Qwen3-32B")
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen3-32B")
 
 _vllm_async_client: Optional[httpx.AsyncClient] = None
 
@@ -82,37 +82,43 @@ async def _call_vllm(
     max_model_len: Optional[int] = None,
     beam_size: int = 1,
 ) -> Dict[str, Any]:
-    """异步调用 vLLM completions API,自动重试."""
+    """异步调用 vLLM chat API,自动重试."""
     payload = {
         "model": MODEL_NAME,
-        "prompt": prompt,
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ],
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
-        "best_of": best_of,
-        "repetition_penalty": repetition_penalty,
-        "frequency_penalty": frequency_penalty,
-        "presence_penalty": presence_penalty,
     }
     if top_k > 0:
         payload["top_k"] = top_k
     if stop:
         payload["stop"] = stop
     if logprobs is not None:
-        payload["logprobs"] = logprobs
-        payload["logprobs_per_token"] = True
-    if echo:
-        payload["echo"] = echo
+        payload["logprobs"] = True
+        payload["top_logprobs"] = min(logprobs, 20) if logprobs > 0 else None
     if max_model_len is not None:
         payload["max_model_len"] = max_model_len
     if beam_size > 1:
         payload["beam_size"] = beam_size
+    if repetition_penalty != 1.0:
+        payload["repetition_penalty"] = repetition_penalty
 
     client = await _get_vllm_async_client()
     for attempt in range(RETRY_CONFIG["max_retries"] + 1):
-        resp = await client.post(f"{VLLM_URL}/v1/completions", json=payload)
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = await client.post(f"{VLLM_URL}/v1/chat/completions", json=payload)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400 and attempt < RETRY_CONFIG["max_retries"]:
+                logger.warning(f"vLLM 400 error, retrying: {e.response.text[:200]}")
+                await asyncio.sleep(0.5)
+                continue
+            raise
 
 
 def _apply_stop_strings(text: str, stop_list: List[str]) -> str:
@@ -202,7 +208,7 @@ def get_sla_from_deadline(deadline_ms: Optional[int],
 
         if ratio < threshold:
             # 时间不足，降级SLA
-            metrics.inc_counter("inference.sla_downgraded", labels={"from": base_sla})
+            _metrics.inc_counter("inference.sla_downgraded", labels={"from": base_sla})
 
             # 根据紧迫程度决定降级到什么级别
             if ratio < 0.8:
@@ -297,10 +303,22 @@ def warmup_model():
         ("Explain quantum physics", "standard"),
         ("Write a short story", "high_quality"),
     ]
-    for prompt, sla in warmup_prompts:
-        for _ in range(3):  # 多次预热确保CUDA graph构建
-            asyncio.run(_call_vllm(prompt=prompt, max_tokens=8,
-                                   temperature=0.0, top_p=1.0, top_k=1))
+
+    async def _do_warmup():
+        for prompt, sla in warmup_prompts:
+            for _ in range(3):  # 多次预热确保CUDA graph构建
+                await _call_vllm(prompt=prompt, max_tokens=8,
+                                temperature=0.0, top_p=1.0, top_k=1)
+
+    try:
+        asyncio.get_running_loop()
+        # 已在运行中的loop，用线程池避免嵌套asyncio.run
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            executor.submit(lambda: asyncio.run(_do_warmup())).result()
+    except RuntimeError:
+        asyncio.run(_do_warmup())
+
     _model_warmed_up = True
 
 
@@ -347,7 +365,9 @@ async def generate_text(
     choices = resp.get("choices", [])
     if not choices:
         return ""
-    text = choices[0].get("text", "")
+    # Chat API 返回 message.content，Completions API 返回 text
+    choice = choices[0]
+    text = choice.get("message", {}).get("content", "") or choice.get("text", "")
     return _apply_stop_strings(text, p["until"])
 
 
@@ -376,13 +396,17 @@ async def compute_logprob(
         prompt=prompt + continuation,
         max_tokens=1,
         logprobs=lp_req,
-        echo=True,
         temperature=0.0,  # 强制greedy确保确定性
         top_p=1.0,
         top_k=1,
     )
 
-    lps = resp.get("choices", [{}])[0].get("logprobs", {}).get("token_logprobs", [])
+    # Chat API: logprobs 在 choices[0].logprobs.content 中
+    # Completions API: logprobs 在 choices[0].logprobs.token_logprobs 中
+    choice = resp.get("choices", [{}])[0]
+    logprobs_data = choice.get("logprobs", {})
+    lps = logprobs_data.get("content", []) or logprobs_data.get("token_logprobs", [])
+    
     if not lps or len(lps) < 2:
         _metrics.inc_counter("inference.logprob_error", labels={"reason": "empty_response"})
         return -10.0
@@ -390,11 +414,13 @@ async def compute_logprob(
     # 精确提取continuation部分的logprob
     if pt > 0 and ct > 0:
         # 正常情况：取prompt之后、continuation长度的部分
-        cont = [lp for lp in lps[pt:pt + ct] if lp is not None]
+        cont = [lp.get("logprob") if isinstance(lp, dict) else lp 
+                for lp in lps[pt:pt + ct] if lp is not None]
     else:
         # 边界情况：使用中点分割
         mid = len(lps) // 2
-        cont = [lp for lp in lps[mid:mid + ct] if lp is not None]
+        cont = [lp.get("logprob") if isinstance(lp, dict) else lp 
+                for lp in lps[mid:mid + ct] if lp is not None]
 
     if not cont:
         _metrics.inc_counter("inference.logprob_error", labels={"reason": "no_valid_tokens"})
@@ -424,13 +450,20 @@ async def compute_rolling_logprob(
 
     resp = await _call_vllm(
         prompt=text, max_tokens=1, logprobs=lp_req,
-        echo=True, temperature=0.0, top_p=1.0, top_k=1,
+        temperature=0.0, top_p=1.0, top_k=1,
     )
 
-    lps = resp.get("choices", [{}])[0].get("logprobs", {}).get("token_logprobs", [])
+    # Chat API: logprobs 在 choices[0].logprobs.content 中
+    choice = resp.get("choices", [{}])[0]
+    logprobs_data = choice.get("logprobs", {})
+    lps = logprobs_data.get("content", []) or logprobs_data.get("token_logprobs", [])
+    
     if not lps or len(lps) < 2:
         return -10.0
-    valid = [lp for lp in lps[1:] if lp is not None]
+    
+    # 提取 logprob 值（可能是 dict 或 float）
+    valid = [lp.get("logprob") if isinstance(lp, dict) else lp 
+             for lp in lps[1:] if lp is not None]
     return float(sum(valid) / len(valid)) if valid else -10.0
 
 
@@ -617,44 +650,20 @@ async def _process_single_message(
     return result
 
 
-def run_inference(
+async def _process_all_async(
     messages: List[Dict[str, Any]],
-    sla_level: Optional[str] = None,
-    deadline_ms: Optional[int] = None,
-    max_concurrent: Optional[int] = None,
+    adaptive_strategy: Dict[str, Any],
+    effective_sla: str,
+    max_concurrent: int,
 ) -> List[Dict[str, Any]]:
-    msg_count = len(messages)
+    """内部异步函数：处理所有消息。"""
+    sem = asyncio.Semaphore(max_concurrent)
 
-    # 使用自适应SLA策略
-    if sla_level is None:
-        # 根据deadline和消息数量自动确定SLA
-        adaptive_strategy = get_adaptive_sla_strategy(deadline_ms, msg_count)
-        # 从策略中推断SLA级别
-        if adaptive_strategy.get("temperature", 0) == 0 and adaptive_strategy.get("max_gen_toks", 0) <= 32:
-            effective_sla = "express"
-        elif adaptive_strategy.get("max_gen_toks", 0) <= 64:
-            effective_sla = "fast"
-        elif adaptive_strategy.get("max_gen_toks", 0) <= 128:
-            effective_sla = "standard"
-        else:
-            effective_sla = "high_quality"
-    else:
-        effective_sla = sla_level
-        adaptive_strategy = get_adaptive_sla_strategy(deadline_ms, msg_count, sla_level)
+    async def bounded(m, i):
+        async with sem:
+            return await _process_single_message(m, i, adaptive_strategy, effective_sla)
 
-    if max_concurrent is None:
-        max_concurrent = CONCURRENCY_CONFIG["max_concurrent_messages"]
-
-    async def process_all():
-        sem = asyncio.Semaphore(max_concurrent)
-
-        async def bounded(m, i):
-            async with sem:
-                return await _process_single_message(m, i, adaptive_strategy, effective_sla)
-
-        return await asyncio.gather(*[bounded(m, i) for i, m in enumerate(messages)], return_exceptions=True)
-
-    raw = asyncio.run(process_all())
+    raw = await asyncio.gather(*[bounded(m, i) for i, m in enumerate(messages)], return_exceptions=True)
     results = []
     for i, r in enumerate(raw):
         if isinstance(r, Exception):
@@ -670,8 +679,66 @@ def run_inference(
         else:
             r["sla_level"] = effective_sla
             results.append(r)
-
     return _aggregate_task_results(results)
+
+
+def _prepare_sla(messages, sla_level, deadline_ms):
+    """准备SLA策略的辅助函数。"""
+    msg_count = len(messages)
+    if sla_level is None:
+        adaptive_strategy = get_adaptive_sla_strategy(deadline_ms, msg_count)
+        if adaptive_strategy.get("temperature", 0) == 0 and adaptive_strategy.get("max_gen_toks", 0) <= 32:
+            effective_sla = "express"
+        elif adaptive_strategy.get("max_gen_toks", 0) <= 64:
+            effective_sla = "fast"
+        elif adaptive_strategy.get("max_gen_toks", 0) <= 128:
+            effective_sla = "standard"
+        else:
+            effective_sla = "high_quality"
+    else:
+        effective_sla = sla_level
+        adaptive_strategy = get_adaptive_sla_strategy(deadline_ms, msg_count, sla_level)
+    return adaptive_strategy, effective_sla
+
+
+def run_inference(
+    messages: List[Dict[str, Any]],
+    sla_level: Optional[str] = None,
+    deadline_ms: Optional[int] = None,
+    max_concurrent: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """同步推理入口，内部正确处理event loop。"""
+    if max_concurrent is None:
+        max_concurrent = CONCURRENCY_CONFIG["max_concurrent_messages"]
+
+    adaptive_strategy, effective_sla = _prepare_sla(messages, sla_level, deadline_ms)
+
+    async def _run():
+        return await _process_all_async(messages, adaptive_strategy, effective_sla, max_concurrent)
+
+    try:
+        asyncio.get_running_loop()
+        # 已在运行中的loop，用线程池避免嵌套asyncio.run
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(lambda: asyncio.run(_run()))
+            return future.result()
+    except RuntimeError:
+        return asyncio.run(_run())
+
+
+async def run_inference_async(
+    messages: List[Dict[str, Any]],
+    sla_level: Optional[str] = None,
+    deadline_ms: Optional[int] = None,
+    max_concurrent: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """异步推理入口，供已有event loop的context调用。"""
+    if max_concurrent is None:
+        max_concurrent = CONCURRENCY_CONFIG["max_concurrent_messages"]
+
+    adaptive_strategy, effective_sla = _prepare_sla(messages, sla_level, deadline_ms)
+    return await _process_all_async(messages, adaptive_strategy, effective_sla, max_concurrent)
 
 
 async def _close_async_client():
@@ -684,4 +751,10 @@ async def _close_async_client():
 
 def close_vllm_client():
     """同步关闭 vLLM 客户端（供 main.py 调用）。"""
-    asyncio.run(_close_async_client())
+    global _vllm_async_client
+    if _vllm_async_client is not None:
+        try:
+            asyncio.run(_close_async_client())
+        except RuntimeError:
+            # Event loop 已关闭，忽略
+            _vllm_async_client = None

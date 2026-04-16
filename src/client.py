@@ -31,7 +31,7 @@ from src.utils.metrics import metrics
 from src.utils.logger import setup_logger, get_logger
 from src.utils.graceful import shutdown_manager
 
-from src.inference import run_inference
+from src.inference import run_inference_async
 
 
 PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://127.0.0.1:8003")
@@ -443,16 +443,25 @@ def load_checkpoint() -> Optional[Dict[str, Any]]:
     return data
 
 
-def register() -> bool:
-    """同步注册。"""
-    resp = requests.post(
-        f"{PLATFORM_URL}/register",
-        json={"name": TEAM_NAME, "token": TOKEN},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    logger.info("registration_success", team=TEAM_NAME)
-    return True
+def register(max_retries: int = 30, retry_interval: float = 2.0) -> bool:
+    """同步注册，等待评测服务就绪。"""
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(
+                f"{PLATFORM_URL}/register",
+                json={"name": TEAM_NAME, "token": TOKEN},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            logger.info("registration_success", team=TEAM_NAME)
+            return True
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            logger.warning("register_retry", attempt=attempt+1, max_retries=max_retries, error=str(e)[:100])
+            if attempt < max_retries - 1:
+                time.sleep(retry_interval)
+            else:
+                raise
+    return False
 
 
 async def query_task(client: httpx.AsyncClient, backoff: Optional[BackoffState] = None) -> Optional[Dict[str, Any]]:
@@ -462,30 +471,62 @@ async def query_task(client: httpx.AsyncClient, backoff: Optional[BackoffState] 
         logger.warning("query_circuit_open", retry_after=retry_after)
         return None
 
-    resp = await client.post(
-        f"{PLATFORM_URL}/query",
-        json={"token": TOKEN},
-        timeout=30.0,
-    )
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            resp = await client.post(
+                f"{PLATFORM_URL}/query",
+                json={"token": TOKEN},
+                timeout=30.0,
+            )
+        except (httpx.ConnectError, httpx.TimeoutException, OSError) as e:
+            _query_breaker.record_failure_sync()
+            logger.warning("query_connection_error", attempt=attempt+1, error=str(e)[:100])
+            if backoff:
+                backoff.record_failure()
+            if attempt < max_retries - 1:
+                wait_time = min(2 ** attempt, 10)
+                await asyncio.sleep(wait_time)
+            continue
 
-    if resp.status_code == 200:
-        _query_breaker.record_success_sync()
-        if backoff:
-            backoff.record_success()
-        return resp.json()
-    elif resp.status_code == 404:
-        return None
-    elif resp.status_code == 429:
-        _query_breaker.record_failure_sync()
-        logger.warning("query_rate_limited")
-        return None
-    else:
-        logger.error("query_failed", status=resp.status_code, response=resp.text)
-        _query_breaker.record_failure_sync()
-        return None
+        if resp.status_code == 200:
+            _query_breaker.record_success_sync()
+            if backoff:
+                backoff.record_success()
+            return resp.json()
+        elif resp.status_code == 404:
+            # 没有可用任务是正常的，不是错误
+            if backoff:
+                backoff.record_success()
+            return None
+        elif resp.status_code == 429:
+            _query_breaker.record_failure_sync()
+            logger.warning("query_rate_limited", attempt=attempt+1)
+            if backoff:
+                backoff.record_failure()
+            if attempt < max_retries - 1:
+                wait_time = min(2 ** attempt, 10)
+                await asyncio.sleep(wait_time)
+            continue
+        elif resp.status_code >= 500:
+            _query_breaker.record_failure_sync()
+            logger.warning("query_server_error", status=resp.status_code, attempt=attempt+1)
+            if backoff:
+                backoff.record_failure()
+            if attempt < max_retries - 1:
+                wait_time = min(2 ** attempt, 10)
+                await asyncio.sleep(wait_time)
+            continue
+        else:
+            logger.error("query_failed", status=resp.status_code, response=resp.text[:200])
+            _query_breaker.record_failure_sync()
+            return None
+
+    logger.warning("query_exhausted_retries")
+    return None
 
 
-async def accept_task(client: httpx.AsyncClient, task_id: int, target_sla: str, backoff: Optional[BackoffState] = None, max_retries: int = 3) -> Optional[Dict[str, Any]]:
+async def accept_task(client: httpx.AsyncClient, task_id: int, target_sla: str, backoff: Optional[BackoffState] = None, max_retries: int = 5) -> Optional[Dict[str, Any]]:
     """接受任务,对瞬时失败进行重试,带熔断器保护。"""
     if not await _ask_breaker.can_attempt():
         retry_after = _ask_breaker._retry_after()
@@ -493,15 +534,25 @@ async def accept_task(client: httpx.AsyncClient, task_id: int, target_sla: str, 
         return None
 
     for attempt in range(max_retries):
-        resp = await client.post(
-            f"{PLATFORM_URL}/ask",
-            json={
-                "token": TOKEN,
-                "task_id": task_id,
-                "sla": target_sla,
-            },
-            timeout=30.0,
-        )
+        try:
+            resp = await client.post(
+                f"{PLATFORM_URL}/ask",
+                json={
+                    "token": TOKEN,
+                    "task_id": task_id,
+                    "sla": target_sla,
+                },
+                timeout=30.0,
+            )
+        except (httpx.ConnectError, httpx.TimeoutException, OSError) as e:
+            _ask_breaker.record_failure_sync()
+            if backoff:
+                backoff.record_failure()
+            logger.warning("ask_connection_error", task_id=task_id, attempt=attempt+1, error=str(e)[:100])
+            if attempt < max_retries - 1:
+                wait_time = min(2 ** attempt, 10)
+                await asyncio.sleep(wait_time)
+            continue
 
         if resp.status_code == 200:
             result = resp.json()
@@ -519,10 +570,10 @@ async def accept_task(client: httpx.AsyncClient, task_id: int, target_sla: str, 
             _ask_breaker.record_failure_sync()
             if backoff:
                 delay = backoff.record_failure()
-            logger.warning("ask_server_error", status=resp.status_code, attempt=attempt+1)
+            logger.warning("ask_server_error", status=resp.status_code, task_id=task_id, attempt=attempt+1)
             if attempt < max_retries - 1:
-                jitter = random.uniform(0.5, 1.5)
-                await asyncio.sleep((delay if backoff else 1 * (attempt + 1)) * jitter)
+                wait_time = min(2 ** attempt, 10)
+                await asyncio.sleep(wait_time)
             continue
         else:
             _ask_breaker.record_failure_sync()
@@ -575,15 +626,27 @@ async def submit_results(client: httpx.AsyncClient, task_data: Dict[str, Any], b
         metrics.inc_counter("client.submit.circuit_open")
         return False
 
+    task_id = task_data.get("overview", {}).get("task_id", "unknown")
+
     for attempt in range(max_retries):
-        resp = await client.post(
-            f"{PLATFORM_URL}/submit",
-            json={
-                "user": {"name": TEAM_NAME, "token": TOKEN},
-                "msg": task_data,
-            },
-            timeout=60.0,
-        )
+        try:
+            resp = await client.post(
+                f"{PLATFORM_URL}/submit",
+                json={
+                    "user": {"name": TEAM_NAME, "token": TOKEN},
+                    "msg": task_data,
+                },
+                timeout=60.0,
+            )
+        except (httpx.ConnectError, httpx.TimeoutException, OSError) as e:
+            _submit_breaker.record_failure_sync()
+            if backoff:
+                backoff.record_failure()
+            logger.warning("submit_connection_error", task_id=task_id, attempt=attempt+1, error=str(e)[:100])
+            if attempt < max_retries - 1:
+                wait_time = min(2 ** attempt, 30)
+                await asyncio.sleep(wait_time)
+            continue
 
         if resp.status_code == 200:
             _submit_breaker.record_success_sync()
@@ -595,14 +658,14 @@ async def submit_results(client: httpx.AsyncClient, task_data: Dict[str, Any], b
             _submit_breaker.record_failure_sync()
             if backoff:
                 delay = backoff.record_failure()
-            logger.warning("submit_error", status=resp.status_code, attempt=attempt+1)
+            logger.warning("submit_error", task_id=task_id, status=resp.status_code, attempt=attempt+1)
             if attempt < max_retries - 1:
-                jitter = random.uniform(0.5, 1.5)
-                await asyncio.sleep((delay if backoff else 2 * (attempt + 1)) * jitter)
+                wait_time = min(2 ** attempt, 30)
+                await asyncio.sleep(wait_time)
             continue
         else:
             _submit_breaker.record_failure_sync()
-            logger.error("submit_failed", status=resp.status_code, response=resp.text)
+            logger.error("submit_failed", task_id=task_id, status=resp.status_code, response=resp.text[:200])
             metrics.inc_counter("client.submit.error")
             return False
 
@@ -635,7 +698,7 @@ async def process_task(
 
     # 使用 SLA 策略运行推理
     logger.info("inference_start", task_id=task_id, msg_count=len(messages), sla=sla_level or "auto")
-    results = run_inference(messages, sla_level=sla_level, deadline_ms=deadline_ms)
+    results = await run_inference_async(messages, sla_level=sla_level, deadline_ms=deadline_ms)
 
     # 构建提交数据
     task_data = {
@@ -814,6 +877,8 @@ async def main_loop():
             else:
                 dynamic_size = PREFETCH_SIZE
 
+            # 当队列较空时，保持预取循环
+            no_task_count = 0
             prefetched = 0
             for _ in range(dynamic_size):
                 if not await task_holder.has_capacity():
@@ -825,7 +890,13 @@ async def main_loop():
                 stats["queries_made"] += 1
 
                 if task_overview is None:
-                    break
+                    # 服务器暂时没有任务，继续等待
+                    no_task_count += 1
+                    if no_task_count >= 3:
+                        # 连续3次没有任务，短暂休眠后重试
+                        await asyncio.sleep(0.5)
+                        no_task_count = 0
+                    continue
 
                 task_id = task_overview.get("task_id")
                 target_sla = task_overview.get("target_sla", "standard")
@@ -855,7 +926,7 @@ async def main_loop():
                 # 正常接受任务
                 task = await accept_task(client, task_id, target_sla, backoff)
                 if task is None:
-                    break
+                    continue
 
                 if await task_holder.add_task(task):
                     prefetched += 1
