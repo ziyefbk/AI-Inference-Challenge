@@ -51,6 +51,7 @@ CHECKPOINT_FILE = os.environ.get("CHECKPOINT_FILE", "/tmp/client_checkpoint.json
 MONITOR_DIR = os.environ.get("MONITOR_DIR", "/tmp/task_monitor")
 MONITOR_QUERIED_FILE = os.path.join(MONITOR_DIR, "queried_tasks.jsonl")
 MONITOR_SUBMITTED_FILE = os.path.join(MONITOR_DIR, "submitted_results.jsonl")
+MONITOR_INFERENCE_FILE = os.path.join(MONITOR_DIR, "inference_results.jsonl")
 
 
 def _init_monitor_dir():
@@ -92,6 +93,26 @@ def _log_task_submitted(task_id, result_msg_count, sla, success):
         "success": success,
     }
     _write_monitor_record(MONITOR_SUBMITTED_FILE, record)
+
+
+def _log_inference_result(task_id, messages: List[Dict[str, Any]], results: List[Dict[str, Any]], sla_level: str):
+    """记录推理的输入（prompt）和输出（response/accuracy）"""
+    records = []
+    for msg, result in zip(messages, results):
+        record = {
+            "event": "inference_result",
+            "timestamp": time.time(),
+            "task_id": task_id,
+            "sla": sla_level,
+            "eval_request_type": msg.get("eval_request_type"),
+            "prompt": msg.get("prompt"),
+            "continuation": msg.get("eval_continuation"),  # loglikelihood 任务的 continuation
+            "response": result.get("response"),  # generate_until 任务的回答
+            "accuracy": result.get("accuracy"),  # loglikelihood 任务的 logprob
+        }
+        records.append(record)
+    for record in records:
+        _write_monitor_record(MONITOR_INFERENCE_FILE, record)
 
 
 # ── 任务完成时间估算配置 ──────────────────────────────────────────────
@@ -779,6 +800,9 @@ async def process_task(
     logger.info("inference_start", task_id=task_id, msg_count=len(messages), sla=sla_level or "auto")
     results = await run_inference_async(messages, sla_level=sla_level, deadline_ms=deadline_ms)
 
+    # 监控: 记录推理的输入和输出
+    _log_inference_result(task_id, messages, results, sla_level or "auto")
+
     # 构建提交数据
     task_data = {
         "overview": overview,
@@ -807,7 +831,9 @@ async def main_loop():
     # 初始化监控目录
     _init_monitor_dir()
     logger.info("monitor_initialized", monitor_dir=MONITOR_DIR,
-                queried_file=MONITOR_QUERIED_FILE, submitted_file=MONITOR_SUBMITTED_FILE)
+                queried_file=MONITOR_QUERIED_FILE,
+                submitted_file=MONITOR_SUBMITTED_FILE,
+                inference_file=MONITOR_INFERENCE_FILE)
 
     # 加载 checkpoint
     checkpoint = load_checkpoint()
