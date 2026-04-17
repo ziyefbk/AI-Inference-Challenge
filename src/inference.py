@@ -32,17 +32,32 @@ logger = get_logger("inference")
 
 # ── 多实例 vLLM 配置 ──────────────────────────────────────────────────────
 # 启动时自动检测 GPU 数量设置，或通过环境变量覆盖
-_VLLM_NUM_INSTANCES = int(os.environ.get("VLLM_NUM_INSTANCES", "1"))
+# 注意：VLLM_NUM_INSTANCES 由 main.py 的 main_loop() 在检测 GPU 后设置
+# 因此 URL 构建采用懒加载方式，避免模块导入时 GPU 还未检测
+
 
 def _build_vllm_urls() -> List[str]:
-    """构建所有 vLLM 实例的 URL 列表。"""
+    """构建所有 vLLM 实例的 URL 列表。
+
+    关键设计：
+    - VLLM_NUM_INSTANCES 在 main_loop() 中被设置（基于 GPU 数量检测）
+    - 此函数在每次调用时重新读取环境变量，确保与 GPU 数量同步
+    - 默认值 1（兼容未设置环境变量的场景）
+    """
     if "VLLM_URLS" in os.environ:
         return [u.strip() for u in os.environ["VLLM_URLS"].split(",") if u.strip()]
-    n = _VLLM_NUM_INSTANCES
+    n = int(os.environ.get("VLLM_NUM_INSTANCES", "1"))
     return [f"http://localhost:{8000 + i}" for i in range(n)]
 
-VLLM_URLS = _build_vllm_urls()
-VLLM_URL = VLLM_URLS[0]  # 兼容单实例场景
+
+def get_vllm_urls() -> List[str]:
+    """获取当前所有 vLLM 实例 URL（懒加载，每次重新构建）。"""
+    return _build_vllm_urls()
+
+
+# 兼容单实例场景的默认 URL（会在多实例场景下被轮询覆盖）
+VLLM_URL = f"http://localhost:8000"
+VLLM_URLS: List[str] = _build_vllm_urls()
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen3-32B")
 
 # ── 客户端池（每实例一个独立客户端） ──────────────────────────────────────
@@ -52,9 +67,10 @@ _url_index = 0  # 轮询索引（线程安全）
 
 
 def _get_next_url() -> str:
-    """轮询获取下一个 vLLM 实例 URL。"""
+    """轮询获取下一个 vLLM 实例 URL（每次调用重新读取）。"""
     global _url_index
-    return VLLM_URLS[_url_index % len(VLLM_URLS)]
+    urls = get_vllm_urls()
+    return urls[_url_index % len(urls)]
 
 
 async def _get_vllm_async_client(url: str) -> httpx.AsyncClient:
@@ -64,8 +80,8 @@ async def _get_vllm_async_client(url: str) -> httpx.AsyncClient:
             _vllm_async_clients[url] = httpx.AsyncClient(
                 timeout=httpx.Timeout(RETRY_CONFIG["request_timeout"]),
                 limits=httpx.Limits(
-                    max_keepalive_connections=int(os.environ.get("VLLM_MAX_KEEPALIVE", "20")),
-                    max_connections=int(os.environ.get("VLLM_MAX_CONNECTIONS", "50")),
+                    max_keepalive_connections=int(os.environ.get("VLLM_MAX_KEEPALIVE", "100")),
+                    max_connections=int(os.environ.get("VLLM_MAX_CONNECTIONS", "200")),
                 ),
             )
         return _vllm_async_clients[url]
@@ -87,21 +103,29 @@ RETRY_CONFIG = {
     "request_timeout": float(os.environ.get("VLLM_TIMEOUT", "120.0")),
 }
 
-# ── 并发配置：多实例自适应 ────────────────────────────────────────────────
-_base_concurrent = int(os.environ.get("MAX_CONCURRENT_MESSAGES", "20"))
-_num_instances = _VLLM_NUM_INSTANCES
+# ── 并发配置：多实例自适应（懒加载）───────────────────────────────────────────
+# 注意：MAX_CONCURRENT_MESSAGES 可以直接设置环境变量
+# 实例数由 main.py 的 main_loop() 在检测 GPU 后设置
 
-# 每实例并发 * 实例数 = 总并发上限（避免过高）
-CONCURRENCY_CONFIG = {
-    "max_concurrent_messages": _base_concurrent * _num_instances,
-    "warmup_enabled": os.environ.get("WARMUP_ENABLED", "true").lower() == "true",
-    "warmup_requests": int(os.environ.get("WARMUP_REQUESTS", "5")),
-}
 
-logger.info("vllm_config",
-            num_instances=_num_instances,
-            urls=VLLM_URLS,
-            max_concurrent=CONCURRENCY_CONFIG["max_concurrent_messages"])
+def get_concurrency_config() -> Dict[str, Any]:
+    """获取并发配置（每次调用时重新读取环境变量）。"""
+    base_concurrent = int(os.environ.get("MAX_CONCURRENT_MESSAGES", "20"))
+    num_instances = int(os.environ.get("VLLM_NUM_INSTANCES", "1"))
+    # 每实例并发 * 实例数 = 总并发上限（避免过高）
+    return {
+        "max_concurrent_messages": base_concurrent * num_instances,
+        "warmup_enabled": os.environ.get("WARMUP_ENABLED", "true").lower() == "true",
+        "warmup_requests": int(os.environ.get("WARMUP_REQUESTS", "5")),
+    }
+
+
+# 默认配置（兼容未设置环境变量的情况）
+CONCURRENCY_CONFIG = get_concurrency_config()
+
+logger.info("vllm_config_initial",
+            default_instances=1,
+            default_max_concurrent=CONCURRENCY_CONFIG["max_concurrent_messages"])
 
 
 @lru_cache(maxsize=4)
@@ -150,9 +174,10 @@ async def _call_vllm(
     if repetition_penalty != 1.0:
         payload["repetition_penalty"] = repetition_penalty
 
-    # 轮询选择 vLLM 实例
+    # 轮询选择 vLLM 实例（每次调用时重新获取 URL 列表，支持动态实例数）
     global _url_index
-    chosen_url = VLLM_URLS[_url_index % len(VLLM_URLS)]
+    urls = get_vllm_urls()
+    chosen_url = urls[_url_index % len(urls)]
     _url_index += 1
 
     client = await _get_vllm_async_client(chosen_url)
@@ -179,6 +204,7 @@ def _apply_stop_strings(text: str, stop_list: List[str]) -> str:
 
 SLA_STRATEGIES: Dict[str, Dict[str, Any]] = {
     # Q60: prompt限制4K以内; Q73: 模型开启thinking mode
+    # 5090 优化：降低 logprobs 请求数量以减少开销
     "express": {
         "max_model_len": 4096, "temperature": 0.0, "top_p": 1.0, "top_k": 1,
         "max_gen_toks": 32, "repetition_penalty": 1.0, "frequency_penalty": 0.0,
@@ -194,13 +220,13 @@ SLA_STRATEGIES: Dict[str, Dict[str, Any]] = {
     "standard": {
         "max_model_len": 4096, "temperature": 0.7, "top_p": 0.9, "top_k": 50,
         "max_gen_toks": 128, "repetition_penalty": 1.1, "frequency_penalty": 0.0,
-        "presence_penalty": 0.0, "beam_size": 1, "logprobs_requested": 20,
+        "presence_penalty": 0.0, "beam_size": 1, "logprobs_requested": 10,
         "n": 1,
     },
     "high_quality": {
         "max_model_len": 4096, "temperature": 0.8, "top_p": 0.95, "top_k": -1,
         "max_gen_toks": 256, "repetition_penalty": 1.2, "frequency_penalty": 0.1,
-        "presence_penalty": 0.1, "beam_size": 1, "logprobs_requested": 100,
+        "presence_penalty": 0.1, "beam_size": 1, "logprobs_requested": 20,
         "n": 1,
     },
 }
@@ -338,7 +364,7 @@ _model_warmed_up = False
 def warmup_model():
     """预热模型,构建 CUDA Graph. Q&A Q58."""
     global _model_warmed_up
-    if _model_warmed_up or not CONCURRENCY_CONFIG["warmup_enabled"]:
+    if _model_warmed_up or not get_concurrency_config()["warmup_enabled"]:
         _model_warmed_up = True
         return
 
@@ -757,7 +783,7 @@ def run_inference(
 ) -> List[Dict[str, Any]]:
     """同步推理入口，内部正确处理event loop。"""
     if max_concurrent is None:
-        max_concurrent = CONCURRENCY_CONFIG["max_concurrent_messages"]
+        max_concurrent = get_concurrency_config()["max_concurrent_messages"]
 
     adaptive_strategy, effective_sla = _prepare_sla(messages, sla_level, deadline_ms)
 
@@ -783,7 +809,7 @@ async def run_inference_async(
 ) -> List[Dict[str, Any]]:
     """异步推理入口，供已有event loop的context调用。"""
     if max_concurrent is None:
-        max_concurrent = CONCURRENCY_CONFIG["max_concurrent_messages"]
+        max_concurrent = get_concurrency_config()["max_concurrent_messages"]
 
     adaptive_strategy, effective_sla = _prepare_sla(messages, sla_level, deadline_ms)
     return await _process_all_async(messages, adaptive_strategy, effective_sla, max_concurrent)
