@@ -194,6 +194,52 @@ async def _call_vllm(
             raise
 
 
+async def _call_vllm_completions(
+    prompt: str,
+    max_tokens: int = 1,
+    logprobs: int = 0,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
+    echo: bool = False,
+) -> Dict[str, Any]:
+    """
+    直接调用 vLLM completions API（不加 chat 格式），用于 loglikelihood 计算。
+
+    Chat API 会插入 system/user 特殊 token，导致 prompt 位置错位。
+    Completions API 直接用原始 prompt，token 位置与 vLLM tokenizer 完全一致。
+    """
+    global _url_index
+    urls = get_vllm_urls()
+    chosen_url = urls[_url_index % len(urls)]
+    _url_index += 1
+
+    payload = {
+        "model": MODEL_NAME,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "logprobs": 1,  # 每个 token 只取 top-1 logprob（vLLM 上限 20，1 足够）
+        "echo": echo,
+    }
+    if top_k > 0:
+        payload["top_k"] = top_k
+
+    client = await _get_vllm_async_client(chosen_url)
+    for attempt in range(RETRY_CONFIG["max_retries"] + 1):
+        try:
+            resp = await client.post(f"{chosen_url}/v1/completions", json=payload)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400 and attempt < RETRY_CONFIG["max_retries"]:
+                logger.warning(f"vLLM completions 400 error, retrying: {e.response.text[:200]}")
+                await asyncio.sleep(0.5)
+                continue
+            raise
+
+
 def _apply_stop_strings(text: str, stop_list: List[str]) -> str:
     for s in stop_list or []:
         idx = text.find(s)
@@ -451,57 +497,70 @@ async def compute_logprob(
     sla_strategy: Optional[Dict[str, Any]] = None,
 ) -> float:
     """
-    计算 log P(continuation | prompt),单次 API 调用。
+    计算 log P(continuation | prompt)，单次 API 调用。
 
-    使用高精度设置确保概率计算的准确性。
+    使用 completions API（而非 chat API）避免特殊 token 导致位置错位，
+    通过 tiktoken 编码位置从 vLLM 的 logprobs 中提取对应 token 的 logprob。
     """
     if not continuation:
         return 0.0
 
     enc = _get_tiktoken_encoding()
-    pt = len(enc.encode(prompt))
-    ct = len(enc.encode(continuation))
-    lp_req = pt + ct
+    # tiktoken 估算 continuation 的 token 数
+    cont_enc = enc.encode(continuation)
+    ct = len(cont_enc)
 
-    # 增加buffer以提高精度，并限制最大请求量
-    lp_req = min(lp_req + 10, 2000)
-
-    resp = await _call_vllm(
-        prompt=prompt + continuation,
-        max_tokens=1,
-        logprobs=lp_req,
-        temperature=0.0,  # 强制greedy确保确定性
+    # max_tokens = continuation 长度，让模型真正生成出所有 continuation token
+    # echo=True 让他同时返回 prompt 的 logprobs，这样 lp_list = prompt_tokens + cont_tokens
+    # logprobs=1 每个 token 只取 top-1（vLLM 上限 20，1 足够）
+    resp = await _call_vllm_completions(
+        prompt=prompt,
+        max_tokens=ct,
+        logprobs=1,
+        temperature=0.0,
         top_p=1.0,
         top_k=1,
+        echo=True,
     )
 
-    # Chat API: logprobs 在 choices[0].logprobs.content 中
-    # Completions API: logprobs 在 choices[0].logprobs.token_logprobs 中
-    choice = resp.get("choices", [{}])[0]
-    logprobs_data = choice.get("logprobs", {})
-    lps = logprobs_data.get("content", []) or logprobs_data.get("token_logprobs", [])
-    
-    if not lps or len(lps) < 2:
-        _metrics.inc_counter("inference.logprob_error", labels={"reason": "empty_response"})
+    # Completions API + echo=True: token_logprobs = [prompt_tok1_logprob, ..., prompt_tokN_logprob, cont_tok1_logprob, ...]
+    # 注意：第一个 token（prompt 起始）的 logprob 通常为 None 或 0
+    choices = resp.get("choices", [{}])
+    if not choices:
+        _metrics.inc_counter("inference.logprob_error", labels={"reason": "no_choices"})
         return -10.0
 
-    # 精确提取continuation部分的logprob
-    if pt > 0 and ct > 0:
-        # 正常情况：取prompt之后、continuation长度的部分
-        cont = [lp.get("logprob") if isinstance(lp, dict) else lp 
-                for lp in lps[pt:pt + ct] if lp is not None]
-    else:
-        # 边界情况：使用中点分割
-        mid = len(lps) // 2
-        cont = [lp.get("logprob") if isinstance(lp, dict) else lp 
-                for lp in lps[mid:mid + ct] if lp is not None]
+    logprobs_data = choices[0].get("logprobs", {})
+    lp_list: List[Any] = logprobs_data.get("token_logprobs", [])
 
-    if not cont:
+    if not lp_list:
+        _metrics.inc_counter("inference.logprob_error", labels={"reason": "empty_logprobs"})
+        return -10.0
+
+    # tiktoken 和 vLLM tokenizer 位置可能有 1-2 个 token 的误差
+    # 用启发式：找到第一个有效负数 logprob 作为 continuation 起始
+    # （prompt 的起始 token logprob 通常是 0 或 None）
+    pt_tik = len(enc.encode(prompt))
+    start = None
+    for i in range(pt_tik, min(pt_tik + 5, len(lp_list))):
+        val = lp_list[i]
+        if val is not None and isinstance(val, (int, float)):
+            start = i
+            break
+    if start is None:
+        start = pt_tik
+
+    cont_logprobs: List[float] = []
+    for i in range(start, len(lp_list)):
+        val = lp_list[i]
+        if val is not None:
+            cont_logprobs.append(float(val))
+
+    if not cont_logprobs:
         _metrics.inc_counter("inference.logprob_error", labels={"reason": "no_valid_tokens"})
         return -10.0
 
-    # 计算总logprob
-    total_logprob = float(sum(cont))
+    total_logprob = float(sum(cont_logprobs))
     _metrics.observe_histogram("inference.logprob_sum", total_logprob)
 
     return total_logprob
@@ -511,34 +570,37 @@ async def compute_rolling_logprob(
     text: str,
     sla_strategy: Optional[Dict[str, Any]] = None,
 ) -> float:
-    """计算整个文本的滚动 log-likelihood."""
+    """计算整个文本的平均 log-likelihood（使用 completions API 避免 chat 格式错位）。"""
     if not text:
         return 0.0
 
     enc = _get_tiktoken_encoding()
     num_tokens = len(enc.encode(text))
-    lp_req = min(num_tokens + 10, 2000)
+    lp_req = 1  # 每个 token 只取 top-1 logprob
 
-    if sla_strategy:
-        lp_req = max(lp_req, min(sla_strategy.get("logprobs_requested", 1000) * 10, 2000))
-
-    resp = await _call_vllm(
-        prompt=text, max_tokens=1, logprobs=lp_req,
-        temperature=0.0, top_p=1.0, top_k=1,
+    resp = await _call_vllm_completions(
+        prompt=text,
+        max_tokens=1,
+        logprobs=lp_req,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=1,
+        echo=True,  # 同时返回输入 token 的 logprobs
     )
 
-    # Chat API: logprobs 在 choices[0].logprobs.content 中
-    choice = resp.get("choices", [{}])[0]
-    logprobs_data = choice.get("logprobs", {})
-    lps = logprobs_data.get("content", []) or logprobs_data.get("token_logprobs", [])
-    
-    if not lps or len(lps) < 2:
+    choices = resp.get("choices", [{}])
+    if not choices:
         return -10.0
-    
-    # 提取 logprob 值（可能是 dict 或 float）
-    valid = [lp.get("logprob") if isinstance(lp, dict) else lp 
-             for lp in lps[1:] if lp is not None]
-    return float(sum(valid) / len(valid)) if valid else -10.0
+
+    logprobs_data = choices[0].get("logprobs", {})
+    lp_list: List[Any] = logprobs_data.get("token_logprobs", [])
+
+    if not lp_list:
+        return -10.0
+
+    valid = [float(lp) for lp in lp_list[1:] if lp is not None]
+    # Q11: 总 logprob，不是平均
+    return float(sum(valid)) if valid else -10.0
 
 
 def _std(values: List[float]) -> float:
