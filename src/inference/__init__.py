@@ -125,7 +125,15 @@ def validate_result(result: Dict[str, Any]) -> bool:
 
 
 def _aggregate_task_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """按 task_id 聚合多 message 结果 (取平均)。"""
+    """
+    按 task_id 聚合多 message 结果。
+
+    重要: 对于 loglikelihood / loglikelihood_rolling 类型，同一题的多条候选
+    message 不做 accuracy 平均——每条消息的 logprob 独立存在，平台会自己做
+    argmax。聚合只是把同 task_id 的消息归拢到同一个结果对象中。
+
+    对于 generate_until 类型，多 message 的正确性分数会由平台取平均（见 Q63）。
+    """
     groups: Dict[int, List[Dict[str, Any]]] = {}
     for r in results:
         tid = r.get("task_id") or r.get("ID") or 0
@@ -141,7 +149,11 @@ def _aggregate_task_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any
             out.append(result)
             continue
 
+        # 同 task_id 有多条 message: 保留所有原始 accuracy，
+        # 不做 logprob 平均（平台对 loglikelihood 自己做 argmax）
         first = group[0].copy()
+
+        # 收集所有 accuracy 用于统计/监控（不出现在提交结果中）
         accs = [r.get("accuracy") for r in group if r.get("accuracy") is not None]
 
         valid_count = 0
@@ -152,16 +164,18 @@ def _aggregate_task_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any
                 r["_validation_failed"] = True
                 METRICS.inc_counter("inference.validation.failed")
 
+        # 保留第一条消息的 accuracy 作为代表性值，
+        # 并附加统计元数据供监控使用
         if accs:
-            first["accuracy"] = sum(accs) / len(accs)
+            first["accuracy"] = group[0].get("accuracy")
             first["accuracy_count"] = len(accs)
             first["accuracy_std"] = _std(accs) if len(accs) > 1 else 0.0
             first["valid_count"] = valid_count
 
-        for r in group:
-            if r.get("response") and not r.get("_validation_failed"):
-                first["response"] = r["response"]
-                break
+        # 收集所有 response（generate_until 可能有多个）
+        responses = [r.get("response") for r in group if r.get("response")]
+        if responses:
+            first["response"] = responses[0]
         first["message_count"] = len(group)
         first["task_id"] = tid
         out.append(first)

@@ -58,17 +58,49 @@ def _resolve_gen_params(
     gen_kwargs: Optional[Dict[str, Any]],
     sla: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """合并生成参数。"""
+    """
+    合并生成参数。
+
+    优先级（高→低）:
+    1. eval_gen_kwargs 中显式指定的字段（平台认为这些是任务必需的）
+    2. SLA 策略中的默认值（作为兜底）
+    """
     defaults = sla or {}
+
+    explicit_temperature = (
+        gen_kwargs.get("temperature") if gen_kwargs and "temperature" in gen_kwargs else None
+    )
+    explicit_max_gen_toks = (
+        gen_kwargs.get("max_gen_toks") if gen_kwargs and "max_gen_toks" in gen_kwargs else None
+    )
+    explicit_top_p = (
+        gen_kwargs.get("top_p") if gen_kwargs and "top_p" in gen_kwargs else None
+    )
+    explicit_top_k = (
+        gen_kwargs.get("top_k") if gen_kwargs and "top_k" in gen_kwargs else None
+    )
+    explicit_until = (
+        gen_kwargs.get("until") if gen_kwargs and "until" in gen_kwargs else None
+    )
+    explicit_rep_penalty = (
+        gen_kwargs.get("repetition_penalty") if gen_kwargs and "repetition_penalty" in gen_kwargs else None
+    )
+    explicit_freq_penalty = (
+        gen_kwargs.get("frequency_penalty") if gen_kwargs and "frequency_penalty" in gen_kwargs else None
+    )
+    explicit_pres_penalty = (
+        gen_kwargs.get("presence_penalty") if gen_kwargs and "presence_penalty" in gen_kwargs else None
+    )
+
     return {
-        "max_gen_toks": gen_kwargs.get("max_gen_toks", defaults.get("max_gen_toks", 256)) if gen_kwargs else defaults.get("max_gen_toks", 256),
-        "temperature": gen_kwargs.get("temperature", defaults.get("temperature", 0.0)) if gen_kwargs else defaults.get("temperature", 0.0),
-        "top_p": gen_kwargs.get("top_p", defaults.get("top_p", 1.0)) if gen_kwargs else defaults.get("top_p", 1.0),
-        "top_k": gen_kwargs.get("top_k", defaults.get("top_k", 50)) if gen_kwargs else defaults.get("top_k", 50),
-        "until": gen_kwargs.get("until", defaults.get("until", ["\n\n"])) if gen_kwargs else defaults.get("until", ["\n\n"]),
-        "repetition_penalty": gen_kwargs.get("repetition_penalty", defaults.get("repetition_penalty", 1.0)) if gen_kwargs else defaults.get("repetition_penalty", 1.0),
-        "frequency_penalty": gen_kwargs.get("frequency_penalty", defaults.get("frequency_penalty", 0.0)) if gen_kwargs else defaults.get("frequency_penalty", 0.0),
-        "presence_penalty": gen_kwargs.get("presence_penalty", defaults.get("presence_penalty", 0.0)) if gen_kwargs else defaults.get("presence_penalty", 0.0),
+        "max_gen_toks": explicit_max_gen_toks if explicit_max_gen_toks is not None else defaults.get("max_gen_toks", 256),
+        "temperature": explicit_temperature if explicit_temperature is not None else defaults.get("temperature", 0.0),
+        "top_p": explicit_top_p if explicit_top_p is not None else defaults.get("top_p", 1.0),
+        "top_k": int(explicit_top_k) if explicit_top_k is not None else int(defaults.get("top_k", 50)),
+        "until": explicit_until if explicit_until is not None else defaults.get("until", ["\n\n"]),
+        "repetition_penalty": explicit_rep_penalty if explicit_rep_penalty is not None else defaults.get("repetition_penalty", 1.0),
+        "frequency_penalty": explicit_freq_penalty if explicit_freq_penalty is not None else defaults.get("frequency_penalty", 0.0),
+        "presence_penalty": explicit_pres_penalty if explicit_pres_penalty is not None else defaults.get("presence_penalty", 0.0),
         "max_model_len": defaults.get("max_model_len"),
         "prompt_tokens": len(prompt.split()),
         "beam_size": defaults.get("beam_size", 1),
@@ -93,11 +125,7 @@ async def process_generate_until(
     result = {"ID": msg_id, "prompt": prompt, "eval_request_type": "generate_until"}
     msg_start = time.time()
 
-    # generate_until 必须使用非零 temperature 避免无限循环
-    if sla_strategy and sla_strategy.get("sampling_key") == "Deterministic":
-        gen_strategy = {**sla_strategy, "temperature": 0.1}
-    else:
-        gen_strategy = sla_strategy
+    gen_strategy = sla_strategy
 
     p = _resolve_gen_params(prompt, gen_kwargs, gen_strategy)
 
@@ -111,7 +139,7 @@ async def process_generate_until(
         temperature=p["temperature"],
         top_p=p["top_p"],
         top_k=p["top_k"],
-        stop=None,
+        stop=p["until"],
         repetition_penalty=p["repetition_penalty"],
         frequency_penalty=p["frequency_penalty"],
         presence_penalty=p["presence_penalty"],

@@ -116,11 +116,10 @@ async def compute_rolling_logprob(text: str) -> float:
     valid = [float(lp) for lp in lp_list[1:] if lp is not None]
     total = float(sum(valid)) if valid else -10.0
 
-    # 归一化: 除以 token 数，避免长文本累积极端负值
+    # 返回总 logprob（平台按 Q10/Q11 要求总 logprob）
     if valid:
-        avg_logprob = total / len(valid)
-        metrics.observe_histogram("inference.logprob_value", avg_logprob, labels={"type": "loglikelihood_rolling"})
-        return avg_logprob  # 返回平均 logprob 而非总和
+        metrics.observe_histogram("inference.logprob_value", total, labels={"type": "loglikelihood_rolling"})
+        return total
 
     return -10.0
 
