@@ -47,6 +47,53 @@ TASK_ACCEPT_TIMEOUT = 300  # 任务领取超时 300s (Q55)
 # Checkpoint 文件路径
 CHECKPOINT_FILE = os.environ.get("CHECKPOINT_FILE", "/tmp/client_checkpoint.json")
 
+# ── 任务监控配置 ──────────────────────────────────────────────────────
+MONITOR_DIR = os.environ.get("MONITOR_DIR", "/tmp/task_monitor")
+MONITOR_QUERIED_FILE = os.path.join(MONITOR_DIR, "queried_tasks.jsonl")
+MONITOR_SUBMITTED_FILE = os.path.join(MONITOR_DIR, "submitted_results.jsonl")
+
+
+def _init_monitor_dir():
+    """初始化监控目录"""
+    os.makedirs(MONITOR_DIR, exist_ok=True)
+
+
+def _write_monitor_record(filepath: str, record: Dict[str, Any]):
+    """写入监控记录到文件"""
+    try:
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning("monitor_write_failed", filepath=filepath, error=str(e))
+
+
+def _log_task_queried(task_id, sla, reward, msg_count, deadline_ms):
+    """记录查询到的任务"""
+    record = {
+        "event": "task_queried",
+        "timestamp": time.time(),
+        "task_id": task_id,
+        "sla": sla,
+        "reward": reward,
+        "msg_count": msg_count,
+        "deadline_ms": deadline_ms,
+    }
+    _write_monitor_record(MONITOR_QUERIED_FILE, record)
+
+
+def _log_task_submitted(task_id, result_msg_count, sla, success):
+    """记录提交的任务"""
+    record = {
+        "event": "task_submitted",
+        "timestamp": time.time(),
+        "task_id": task_id,
+        "result_msg_count": result_msg_count,
+        "sla": sla,
+        "success": success,
+    }
+    _write_monitor_record(MONITOR_SUBMITTED_FILE, record)
+
+
 # ── 任务完成时间估算配置 ──────────────────────────────────────────────
 
 # 基于SLA级别估算单message平均耗时（秒）
@@ -496,7 +543,16 @@ async def query_task(client: httpx.AsyncClient, backoff: Optional[BackoffState] 
             _query_breaker.record_success_sync()
             if backoff:
                 backoff.record_success()
-            return resp.json()
+            task_data = resp.json()
+            # 监控: 记录查询到的任务 (query返回的是TaskOverview,不是{"overview":...})
+            _log_task_queried(
+                task_id=task_data.get("task_id"),
+                sla=task_data.get("target_sla"),
+                reward=task_data.get("target_reward"),
+                msg_count=0,  # query只返回overview,无messages
+                deadline_ms=task_data.get("deadline_ms"),
+            )
+            return task_data
         elif resp.status_code == 404:
             # 没有可用任务是正常的，不是错误
             if backoff:
@@ -662,6 +718,13 @@ async def submit_results(client: httpx.AsyncClient, task_data: Dict[str, Any], b
             if backoff:
                 backoff.record_success()
             metrics.inc_counter("client.submit.success")
+            # 监控: 记录提交的任务
+            _log_task_submitted(
+                task_id=task_id,
+                result_msg_count=len(task_data.get("messages", [])),
+                sla=task_data.get("sla_level"),
+                success=True,
+            )
             return True
         elif resp.status_code == 429 or resp.status_code >= 500:
             _submit_breaker.record_failure_sync()
@@ -676,6 +739,13 @@ async def submit_results(client: httpx.AsyncClient, task_data: Dict[str, Any], b
             _submit_breaker.record_failure_sync()
             logger.error("submit_failed", task_id=task_id, status=resp.status_code, response=resp.text[:200])
             metrics.inc_counter("client.submit.error")
+            # 监控: 记录提交失败
+            _log_task_submitted(
+                task_id=task_id,
+                result_msg_count=len(task_data.get("messages", [])),
+                sla=task_data.get("sla_level"),
+                success=False,
+            )
             return False
 
     metrics.inc_counter("client.submit.exhausted_retries")
@@ -733,6 +803,11 @@ async def main_loop():
     # 注册优雅关闭处理器
     shutdown_manager.register_handler()
     shutdown_manager.set_task_checker(lambda: task_holder.max_held if False else 0)
+
+    # 初始化监控目录
+    _init_monitor_dir()
+    logger.info("monitor_initialized", monitor_dir=MONITOR_DIR,
+                queried_file=MONITOR_QUERIED_FILE, submitted_file=MONITOR_SUBMITTED_FILE)
 
     # 加载 checkpoint
     checkpoint = load_checkpoint()
