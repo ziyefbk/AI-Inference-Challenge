@@ -467,8 +467,11 @@ def register(max_retries: int = 30, retry_interval: float = 2.0) -> bool:
 async def query_task(client: httpx.AsyncClient, backoff: Optional[BackoffState] = None) -> Optional[Dict[str, Any]]:
     """查询可用任务,包含重试逻辑和熔断器保护。"""
     if not await _query_breaker.can_attempt():
-        retry_after = _query_breaker._retry_after()
-        logger.warning("query_circuit_open", retry_after=retry_after)
+        now = time.monotonic()
+        if now - _query_breaker._last_warn_time >= 10.0:  # 防日志风暴: 最多每10s警告一次
+            retry_after = _query_breaker._retry_after()
+            logger.warning("query_circuit_open", retry_after=retry_after)
+            _query_breaker._last_warn_time = now
         return None
 
     max_retries = 5
@@ -529,8 +532,11 @@ async def query_task(client: httpx.AsyncClient, backoff: Optional[BackoffState] 
 async def accept_task(client: httpx.AsyncClient, task_id: int, target_sla: str, backoff: Optional[BackoffState] = None, max_retries: int = 5) -> Optional[Dict[str, Any]]:
     """接受任务,对瞬时失败进行重试,带熔断器保护。"""
     if not await _ask_breaker.can_attempt():
-        retry_after = _ask_breaker._retry_after()
-        logger.warning("ask_circuit_open", task_id=task_id, retry_after=retry_after)
+        now = time.monotonic()
+        if now - _ask_breaker._last_warn_time >= 10.0:
+            retry_after = _ask_breaker._retry_after()
+            logger.warning("ask_circuit_open", task_id=task_id, retry_after=retry_after)
+            _ask_breaker._last_warn_time = now
         return None
 
     for attempt in range(max_retries):
@@ -621,9 +627,12 @@ async def reject_task(client: httpx.AsyncClient, task_id: int, backoff: Optional
 async def submit_results(client: httpx.AsyncClient, task_data: Dict[str, Any], backoff: Optional[BackoffState] = None, max_retries: int = 5) -> bool:
     """提交推理结果,包含重试逻辑,带熔断器保护。提交重要,使用较多重试次数。"""
     if not await _submit_breaker.can_attempt():
-        retry_after = _submit_breaker._retry_after()
-        logger.warning("submit_circuit_open", retry_after=retry_after)
-        metrics.inc_counter("client.submit.circuit_open")
+        now = time.monotonic()
+        if now - _submit_breaker._last_warn_time >= 10.0:
+            retry_after = _submit_breaker._retry_after()
+            logger.warning("submit_circuit_open", retry_after=retry_after)
+            metrics.inc_counter("client.submit.circuit_open")
+            _submit_breaker._last_warn_time = now
         return False
 
     task_id = task_data.get("overview", {}).get("task_id", "unknown")
@@ -813,15 +822,6 @@ async def main_loop():
                 task_id = overview.get("task_id")
                 sla_level = overview.get("target_sla")
 
-                # 估算剩余时间
-                deadline_ms = overview.get("deadline_ms")
-                if deadline_ms:
-                    remaining = deadline_ms / 1000.0
-                    if remaining < 1:
-                        logger.warning("task_about_to_expire", task_id=task_id)
-                        stats["tasks_expired"] += 1
-                        continue
-
                 start_time = time.monotonic()
                 success = await process_task(client, task, backoff, sla_level)
                 elapsed = time.monotonic() - start_time
@@ -836,7 +836,7 @@ async def main_loop():
                     else:
                         stats["tasks_failed"] += 1
                         metrics.inc_counter("client.tasks.failed")
-                        logger.error("task_failed", task_id=task_id)
+                        logger.error("task_failed", task_id=task_id, elapsed=elapsed)
 
                 # 定期保存 checkpoint
                 if time.time() - last_checkpoint > 60:

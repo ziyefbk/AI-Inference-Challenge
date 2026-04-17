@@ -153,13 +153,17 @@ def start_vllm_background():
     except Exception:
         pass
 
-    # 查找可用的 Python
-    for py in ["python3.12", "python3.11", "python3"]:
-        if shutil.which(py):
-            PYTHON_BIN = py
-            break
+    # 查找可用的 Python（优先使用 contestant_env）
+    contestant_python = "/tmp/contestant_env/bin/python3.12"
+    if os.path.exists(contestant_python):
+        PYTHON_BIN = contestant_python
     else:
-        PYTHON_BIN = "python3"
+        for py in ["python3.12", "python3.11", "python3"]:
+            if shutil.which(py):
+                PYTHON_BIN = py
+                break
+        else:
+            PYTHON_BIN = "python3"
 
     # 确定实例数量：每个 GPU 一个实例
     num_instances = max(1, num_gpus)
@@ -189,13 +193,16 @@ def start_vllm_background():
             ])
             print(f"[Main] 实例 {i} 启用投机解码: {SPECULATIVE_MODEL}")
 
-        print(f"[Main] 启动 vLLM 实例 {i}: {' '.join(vllm_cmd)}")
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        print(f"[Main] 启动 vLLM 实例 {i}: {' '.join(vllm_cmd)} (GPU {gpu_id})")
 
         proc = subprocess.Popen(
             vllm_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             preexec_fn=os.setsid if hasattr(os, "setsid") else None,
+            env=env,
         )
         all_procs.append((i, port, proc))
 

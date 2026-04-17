@@ -80,6 +80,7 @@ class CircuitBreaker:
         self._last_failure_time: Optional[float] = None
         self._half_open_calls: int = 0
         self._lock = asyncio.Lock()
+        self._last_warn_time: float = 0.0  # 防日志风暴: 仅警告一次
 
     @property
     def state(self) -> str:
