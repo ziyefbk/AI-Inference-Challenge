@@ -172,6 +172,11 @@ def start_vllm_background():
     # speculative decoding 支持 (Q33: 允许使用小模型进行投机解码)
     SPECULATIVE_MODEL = os.environ.get("SPECULATIVE_MODEL", "")
 
+    # 设置环境变量，让 inference.py 能感知实例数量
+    # 注意：必须在 warmup_model() 之前设置，否则预热只会暖一个实例
+    os.environ["VLLM_NUM_INSTANCES"] = str(num_instances)
+    print(f"[Main] vLLM 实例配置: {num_instances} 实例 / {num_gpus} GPU, 端口 {[8000 + i for i in range(num_instances)]}")
+
     # 为每个实例创建启动参数
     all_procs = []
     for i in range(num_instances):
@@ -184,6 +189,16 @@ def start_vllm_background():
             "--port", str(port),
             "--gpu-memory-utilization", "0.9",
             "--tensor-parallel-size", "1",
+            # 性能优化参数
+            "--enable-prefix-caching",            # 前缀缓存，减少重复 prompt 计算
+            "--disable-log-stats",               # 禁用统计日志
+            "--disable-uvicorn-access-log",      # 禁用 uvicorn 访问日志
+            # 流式 prefill 优化
+            "--enable-chunked-prefill",
+            "--max-num-batched-tokens", "8192",
+            "--max-num-seqs", "256",
+            # uBATCH 优化
+            "--ubatch-size", "256",
         ]
 
         if SPECULATIVE_MODEL:

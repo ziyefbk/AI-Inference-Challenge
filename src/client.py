@@ -122,8 +122,8 @@ def estimate_task_feasible(task: Dict[str, Any], sla_level: str,
 
 # 连接池配置
 CLIENT_LIMITS = httpx.Limits(
-    max_connections=int(os.environ.get("CLIENT_MAX_CONNECTIONS", "128")),
-    max_keepalive_connections=int(os.environ.get("CLIENT_MAX_KEEPALIVE", "64")),
+    max_connections=int(os.environ.get("CLIENT_MAX_CONNECTIONS", "256")),
+    max_keepalive_connections=int(os.environ.get("CLIENT_MAX_KEEPALIVE", "128")),
 )
 
 # 初始化日志和指标
@@ -769,14 +769,18 @@ async def main_loop():
     except Exception:
         pass
 
-    # 根据 GPU 数量调整并发参数
+    # 根据 GPU 数量调整并发参数（5卡5090场景优化）
     if num_gpus > 1:
-        # 多 GPU 环境：增加 worker 数量和预取大小
-        NUM_WORKERS = min(base_workers + num_gpus, 20)  # 最多 20 个 worker
-        PREFETCH_SIZE = base_prefetch * 2  # 预取翻倍
+        # 多 GPU 环境：大幅增加 worker 数量，充分利用5卡5090的高并发能力
+        # 每个 GPU 分配 4-8 个 worker，确保不空闲
+        NUM_WORKERS = min(base_workers + num_gpus * 3, 32)  # 5卡场景下可达 32 个 worker
+        PREFETCH_SIZE = base_prefetch * 3  # 预取量翻 3 倍
         # 通知 inference.py 使用多实例
         os.environ["VLLM_NUM_INSTANCES"] = str(num_gpus)
-        logger.info("multi_gpu_config", num_gpus=num_gpus, num_workers=NUM_WORKERS, prefetch_size=PREFETCH_SIZE)
+        # 调整每实例并发，适配高吞吐
+        os.environ["MAX_CONCURRENT_MESSAGES"] = str(min(32, 16 + num_gpus * 2))
+        logger.info("multi_gpu_config", num_gpus=num_gpus, num_workers=NUM_WORKERS, prefetch_size=PREFETCH_SIZE,
+                    concurrent_per_instance=os.environ.get("MAX_CONCURRENT_MESSAGES"))
     else:
         # 单 GPU 环境：使用配置的参数
         NUM_WORKERS = base_workers
