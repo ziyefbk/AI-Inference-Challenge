@@ -142,7 +142,7 @@ async def main_loop() -> None:
                     await asyncio.sleep(0.05)
                     continue
 
-                task, _ = item
+                task, _, bucket = item
                 overview = task.get("overview", {})
                 task_id = overview.get("task_id")
                 sla_level = overview.get("target_sla")
@@ -162,7 +162,7 @@ async def main_loop() -> None:
                         sla=sla_level,
                         success=True,
                     )
-                    logger.info("task_completed", task_id=task_id, elapsed=elapsed, worker_id=worker_id)
+                    logger.info("task_completed", task_id=task_id, elapsed=elapsed, worker_id=worker_id, bucket=bucket)
                 else:
                     stats["tasks_failed"] += 1
                     # metrics.inc_counter("client.tasks.failed")
@@ -172,7 +172,7 @@ async def main_loop() -> None:
                         sla=sla_level,
                         success=False,
                     )
-                    logger.error("task_failed", task_id=task_id, elapsed=elapsed)
+                    logger.error("task_failed", task_id=task_id, elapsed=elapsed, bucket=bucket)
 
                 if time.time() - last_checkpoint > 60:
                     holder_stats = await task_holder.get_stats()
@@ -189,6 +189,8 @@ async def main_loop() -> None:
                         failed=stats["tasks_failed"],
                         expired=stats["tasks_expired"],
                         held=holder_stats["held"],
+                        short_held=holder_stats.get("short_held", 0),
+                        long_held=holder_stats.get("long_held", 0),
                         avg_inference_time=avg_time,
                         circuit_breaker_states={
                             name: cb.state
