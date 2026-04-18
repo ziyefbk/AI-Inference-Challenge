@@ -191,6 +191,8 @@ async def chat_completions(
                     await asyncio.sleep(0.2 * (attempt + 1))
                     continue
             return result
+        except asyncio.CancelledError:
+            raise
         except (httpx.TimeoutException, httpx.HTTPStatusError, OSError) as e:
             is_retryable = False
             body_hint = ""
@@ -311,6 +313,8 @@ async def completions(
                     await asyncio.sleep(0.2 * (attempt + 1))
                     continue
             return result
+        except asyncio.CancelledError:
+            raise
         except (httpx.TimeoutException, httpx.HTTPStatusError, OSError) as e:
             is_retryable = False
             body_hint = ""
