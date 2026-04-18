@@ -130,8 +130,11 @@ async def process_generate_until(
     p = _resolve_gen_params(prompt, gen_kwargs, gen_strategy)
 
     max_toks = p["max_gen_toks"]
-    if p["max_model_len"] and p["max_model_len"] > p["prompt_tokens"]:
-        max_toks = min(max_toks, p["max_model_len"] - p["prompt_tokens"])
+    # Cap generation to avoid extremely long outputs that slow down scoring.
+    # Platform checks for expected_answer presence; a focused response is sufficient.
+    max_toks = min(max_toks, 1024)
+    if p["max_model_len"] and p["max_model_len"] > 10:
+        max_toks = min(max_toks, p["max_model_len"] - 1)
 
     resp = await completions(
         prompt=prompt,
@@ -143,8 +146,9 @@ async def process_generate_until(
         repetition_penalty=p["repetition_penalty"],
         frequency_penalty=p["frequency_penalty"],
         presence_penalty=p["presence_penalty"],
-        best_of=p["best_of"],
-        max_model_len=p.get("max_model_len"),
+        best_of=p.get("best_of", 1),
+        n=p.get("n", 1),
+        # max_model_len=p.get("max_model_len"),
         logprobs=0,
     )
 

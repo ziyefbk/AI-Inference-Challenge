@@ -25,6 +25,7 @@ from src.client.platform import (
 )
 from src.client.task_holder import PriorityTaskHolder, estimate_task_feasible
 from src.client.monitor import init_monitor, log_queried, log_submitted
+from src.inference.vllm import interrupt_vllm_requests
 from src.utils.logger import setup_logger, get_logger
 from src.utils.graceful import shutdown_manager
 from src.utils.metrics import metrics
@@ -63,6 +64,7 @@ def load_checkpoint() -> Optional[dict]:
 async def main_loop() -> None:
     """主客户端循环。"""
     shutdown_manager.register_handler()
+    shutdown_manager.on_shutdown_begin(interrupt_vllm_requests)
 
     init_monitor()
     logger.info("monitor_initialized")
@@ -81,7 +83,6 @@ async def main_loop() -> None:
 
     backoff = BackoffState()
     rate_limiter = RateLimiter(max_rate=MAX_QUERY_RATE, burst=MAX_QUERY_RATE)
-    task_holder = PriorityTaskHolder(max_held=MAX_HELD_TASKS, timeout_s=TASK_ACCEPT_TIMEOUT)
 
     # 动态配置 Worker
     base_workers = int(os.environ.get("NUM_WORKERS", "3"))
@@ -107,6 +108,12 @@ async def main_loop() -> None:
         num_workers = base_workers
         prefetch_size = base_prefetch
         logger.info("single_gpu_config", num_workers=num_workers, prefetch_size=prefetch_size)
+
+    # holder 容量应与 worker 数量匹配，避免 prefetch 超过处理能力导致任务堆积
+    task_holder = PriorityTaskHolder(
+        max_held=max(int(os.environ.get("MAX_HELD_TASKS", str(num_workers * 4))), num_workers * 4),
+        timeout_s=TASK_ACCEPT_TIMEOUT
+    )
 
     async with httpx.AsyncClient(timeout=60, limits=CLIENT_LIMITS) as client:
         if not register():
@@ -149,10 +156,22 @@ async def main_loop() -> None:
                     stats["total_inference_time"] += elapsed
                     metrics.inc_counter("client.tasks.completed")
                     metrics.observe_histogram("client.inference_time", elapsed)
+                    log_submitted(
+                        task_id=task_id,
+                        result_msg_count=len(task.get("messages", [])),
+                        sla=sla_level,
+                        success=True,
+                    )
                     logger.info("task_completed", task_id=task_id, elapsed=elapsed, worker_id=worker_id)
                 else:
                     stats["tasks_failed"] += 1
                     metrics.inc_counter("client.tasks.failed")
+                    log_submitted(
+                        task_id=task_id,
+                        result_msg_count=len(task.get("messages", [])),
+                        sla=sla_level,
+                        success=False,
+                    )
                     logger.error("task_failed", task_id=task_id, elapsed=elapsed)
 
                 if time.time() - last_checkpoint > 60:
@@ -238,12 +257,16 @@ async def main_loop() -> None:
 
                 task = await accept_task(client, task_id, target_sla, backoff)
                 if task is None:
+                    # 竞争失败：任务从 queried 集合移除，需要显式 reject 让 matcher 释放
+                    await reject_task(client, task_id, backoff, reason="accept_failed")
                     continue
 
                 if await task_holder.add_task(task):
                     prefetched += 1
                     logger.debug("task_prefetched", task_id=task_id)
                 else:
+                    # 任务已被接受(inflight)，但 holder 满了，需要拒绝它让 matcher 重新分配
+                    await reject_task(client, task_id, backoff, reason="holder_full")
                     break
 
             return prefetched

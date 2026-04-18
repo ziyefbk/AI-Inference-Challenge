@@ -14,6 +14,9 @@
 import os
 import asyncio
 import concurrent.futures
+import signal
+import subprocess
+import time
 from typing import List, Dict, Any, Optional
 
 from src.inference.vllm import close_all_clients
@@ -62,25 +65,86 @@ def warmup_model() -> None:
 
     logger.info("开始预热模型...")
 
-    async def _do_warmup():
-        from src.inference.vllm import chat_completions
-        prompts = [
-            ("Hello", "express"),
-            ("What is 2+2?", "fast"),
-            ("The capital of France is", "standard"),
-        ]
-        for prompt, sla in prompts:
-            for _ in range(3):
-                await chat_completions(prompt=prompt, max_tokens=8, temperature=0.0, top_p=1.0, top_k=1)
+    for attempt in range(3):
+        try:
+            _do_warmup_impl()
+            _model_warmed_up = True
+            logger.info("预热完成")
+            return
+        except Exception as e:
+            logger.warning("warmup_attempt_failed", attempt=attempt + 1, error=str(e)[:150])
+            if attempt < 2:
+                _cleanup_orphaned_enginecores()
+                time.sleep(3)
 
-    try:
-        asyncio.get_running_loop()
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            executor.submit(lambda: asyncio.run(_do_warmup())).result()
-    except RuntimeError:
-        asyncio.run(_do_warmup())
-
+    logger.warning("预热失败，继续启动（推理时会重试）")
     _model_warmed_up = True
+
+
+def _do_warmup_impl() -> None:
+    """同步预热实现，不依赖运行中的事件循环。
+
+    用独立的 httpx client 避免 warmup 的 event loop 状态污染全局 client pool。
+    """
+    async def _do_warmup():
+        import httpx
+        from src.inference.vllm import chat_completions, RETRY_CONFIG, MODEL_PATH, get_vllm_urls
+        # Create an isolated client so warmup's loop doesn't pollute _vllm_async_clients.
+        urls = get_vllm_urls()
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(RETRY_CONFIG["request_timeout"]),
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        )
+        try:
+            prompts = [
+                ("Hello", "express"),
+                ("What is 2+2?", "fast"),
+                ("The capital of France is", "standard"),
+            ]
+            for prompt, _ in prompts:
+                await chat_completions(prompt=prompt, max_tokens=8, temperature=0.0, top_p=1.0, top_k=1)
+        finally:
+            await client.aclose()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_do_warmup())
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+def _cleanup_orphaned_enginecores() -> None:
+    """杀掉残留的 VLLM EngineCore 孤儿进程，释放显存。
+
+    在 main.py 的 main() 调用前仅做占位，启动后由 main.py 填充真实实现。
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return
+        killed = []
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split(",")
+            if len(parts) < 2:
+                continue
+            try:
+                pid = int(parts[0].strip())
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+            except (ValueError, ProcessLookupError, PermissionError):
+                pass
+        if killed:
+            time.sleep(2)
+            logger.info(f"已清理残留 EngineCore: {killed}")
+    except Exception:
+        pass
 
 
 # ── 指标 ─────────────────────────────────────────────────────────────
@@ -230,7 +294,9 @@ async def _process_all_async(
     for i, r in enumerate(raw):
         if isinstance(r, Exception):
             msg = messages[i]
-            logger.error(f"处理消息 {msg.get('ID')} 出错: {r}")
+            import traceback
+            tb = traceback.format_exception(type(r), r, r.__traceback__)
+            logger.error(f"处理消息 {msg.get('ID')} 出错: {r}\n{''.join(tb)}")
             results.append({
                 "ID": msg.get("ID"), "prompt": msg.get("prompt"),
                 "eval_request_type": msg.get("eval_request_type", "loglikelihood"),

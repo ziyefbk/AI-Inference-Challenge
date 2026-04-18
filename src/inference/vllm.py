@@ -19,7 +19,19 @@ from src.utils.logger import setup_logger, get_logger
 setup_logger(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = get_logger("inference.vllm")
 
+# 用于在关闭时快速终止重试
+_shutdown_interrupt = False
+
+
+def interrupt_vllm_requests() -> None:
+    """通知 vLLM 模块停止重试并快速失败。"""
+    global _shutdown_interrupt
+    _shutdown_interrupt = True
+
+
 MODEL_PATH = os.environ.get("MODEL_PATH", "/root/autodl-tmp/models/Qwen2.5-0.5B")
+# Qwen2.5-0.5B context window = 32768, reserve headroom for prompt tokens
+MODEL_MAX_LEN = int(os.environ.get("MODEL_MAX_LEN", "1000"))
 
 # 重试配置
 RETRY_CONFIG = {
@@ -127,10 +139,20 @@ async def chat_completions(
     if repetition_penalty != 1.0:
         payload["repetition_penalty"] = repetition_penalty
 
+    # Clamp max_tokens to avoid vLLM 400
+    payload["max_tokens"] = min(payload["max_tokens"], MODEL_MAX_LEN)
+
     client = await _get_client(chosen_url)
+    logger.debug("vllm_request", url=f"{chosen_url}/v1/chat/completions", payload=payload)
+
     for attempt in range(RETRY_CONFIG["max_retries"] + 1):
+        if _shutdown_interrupt:
+            raise asyncio.CancelledError("shutdown in progress")
         try:
             resp = await client.post(f"{chosen_url}/v1/chat/completions", json=payload)
+            _err_body: Dict[str, Any] = {}
+            if resp.status_code == 400:
+                _err_body["vllm"] = resp.content.decode(errors="replace")
             resp.raise_for_status()
             result = resp.json()
             choices = result.get("choices", [])
@@ -142,9 +164,14 @@ async def chat_completions(
             return result
         except (httpx.TimeoutException, httpx.HTTPStatusError, OSError) as e:
             is_retryable = False
+            body_hint = ""
             if isinstance(e, httpx.HTTPStatusError):
                 sc = e.response.status_code
-                is_retryable = sc >= 500 or sc == 400 or sc == 429
+                is_retryable = sc >= 500 or sc == 429
+                if sc == 400:
+                    body = _err_body.get("vllm") or e.response.content.decode(errors="replace")
+                    body_hint = f" | vLLM: {body[:300] if body else 'empty'}"
+                    logger.warning("vllm_400_detail", body=body[:500] if body else "empty", payload_keys=list(payload.keys()))
             elif isinstance(e, httpx.TimeoutException):
                 is_retryable = True
             elif isinstance(e, OSError):
@@ -152,9 +179,16 @@ async def chat_completions(
 
             if is_retryable and attempt < RETRY_CONFIG["max_retries"]:
                 backoff = min(RETRY_CONFIG["backoff_factor"] ** attempt, RETRY_CONFIG["max_backoff"])
-                logger.warning("chat_retry", attempt=attempt + 1, error=str(e)[:100])
+                err_msg = str(e) if str(e) else repr(e)
+                if not err_msg or err_msg == "''":
+                    err_msg = f"{type(e).__name__}"
+                logger.warning(f"chat_retry{body_hint}", attempt=attempt + 1, error=err_msg)
                 await asyncio.sleep(backoff)
                 continue
+            err_msg = str(e) if str(e) else repr(e)
+            if not err_msg or err_msg == "''":
+                err_msg = f"{type(e).__name__}"
+            logger.error(f"chat_failed{body_hint}", error=err_msg)
             raise
 
 
@@ -173,6 +207,7 @@ async def completions(
     frequency_penalty: float = 0.0,
     presence_penalty: float = 0.0,
     best_of: int = 1,
+    n: int = 1,
     max_model_len: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
@@ -194,9 +229,10 @@ async def completions(
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
-        "logprobs": logprobs,
-        "echo": echo,
     }
+    if logprobs > 0:
+        payload["logprobs"] = logprobs
+        payload["echo"] = echo
     if top_k > 0:
         payload["top_k"] = top_k
     if stop is not None:
@@ -209,13 +245,25 @@ async def completions(
         payload["presence_penalty"] = presence_penalty
     if best_of > 1:
         payload["best_of"] = best_of
-    if max_model_len is not None:
-        payload["max_model_len"] = max_model_len
+        payload["n"] = max(n, best_of)
+    elif n > 1:
+        payload["n"] = n
+
+    # Clamp max_tokens to avoid vLLM 400: max_tokens exceeds max_model_len
+    payload["max_tokens"] = min(payload["max_tokens"], MODEL_MAX_LEN)
 
     client = await _get_client(chosen_url)
+    logger.debug("vllm_request", url=f"{chosen_url}/v1/completions", payload=payload)
+
     for attempt in range(RETRY_CONFIG["max_retries"] + 1):
+        if _shutdown_interrupt:
+            raise asyncio.CancelledError("shutdown in progress")
         try:
             resp = await client.post(f"{chosen_url}/v1/completions", json=payload)
+            if resp.status_code == 400:
+                body = resp.content.decode(errors="replace")
+                logger.warning("vllm_400_detail", body=body[:500], payload_keys=list(payload.keys()))
+                resp.raise_for_status()
             resp.raise_for_status()
             result = resp.json()
             choices = result.get("choices", [])
@@ -227,9 +275,15 @@ async def completions(
             return result
         except (httpx.TimeoutException, httpx.HTTPStatusError, OSError) as e:
             is_retryable = False
+            body_hint = ""
             if isinstance(e, httpx.HTTPStatusError):
                 sc = e.response.status_code
-                is_retryable = sc >= 500 or sc == 400 or sc == 429
+                is_retryable = sc >= 500 or sc == 429
+                # Don't retry 400 - it means bad request, won't change
+                if sc == 400:
+                    body = _err_body.get("vllm") or e.response.content.decode(errors="replace")
+                    body_hint = f" | vLLM: {body[:300] if body else 'empty'}"
+                    logger.warning("vllm_400_detail", body=body[:500] if body else "empty", payload_keys=list(payload.keys()))
             elif isinstance(e, httpx.TimeoutException):
                 is_retryable = True
             elif isinstance(e, OSError):
@@ -237,7 +291,14 @@ async def completions(
 
             if is_retryable and attempt < RETRY_CONFIG["max_retries"]:
                 backoff = min(RETRY_CONFIG["backoff_factor"] ** attempt, RETRY_CONFIG["max_backoff"])
-                logger.warning("completions_retry", attempt=attempt + 1, error=str(e)[:100])
+                err_msg = str(e) if str(e) else repr(e)
+                if not err_msg or err_msg == "''":
+                    err_msg = f"{type(e).__name__}"
+                logger.warning(f"completions_retry{body_hint}", attempt=attempt + 1, error=err_msg)
                 await asyncio.sleep(backoff)
                 continue
+            err_msg = str(e) if str(e) else repr(e)
+            if not err_msg or err_msg == "''":
+                err_msg = f"{type(e).__name__}"
+            logger.error(f"completions_failed{body_hint}", error=err_msg)
             raise

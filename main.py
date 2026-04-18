@@ -70,13 +70,11 @@ def setup_signal_handlers() -> None:
         global _shutdown_requested
         _shutdown_requested = True
         logger.info("收到 SIGTERM, 准备优雅关闭")
-        cleanup_vllm()
 
     def _sigint(signum, frame):
         global _shutdown_requested
         _shutdown_requested = True
         logger.info("收到 Ctrl+C, 准备关闭")
-        cleanup_vllm()
 
     signal.signal(signal.SIGTERM, _sigterm)
     signal.signal(signal.SIGINT, _sigint)
@@ -86,25 +84,73 @@ def setup_signal_handlers() -> None:
 # ── vLLM 进程管理 ───────────────────────────────────────────────────────
 
 def cleanup_vllm() -> None:
-    """清理所有 vLLM 进程。"""
+    """清理所有 vLLM 进程。
+
+    优先通过 /shutdown 端点优雅关闭（会连带关闭 EngineCore 子进程），
+    如果失败再退而用 SIGTERM/SIGKILL。
+    """
     global _vllm_procs
     for i, port, proc in _vllm_procs:
         try:
-            if hasattr(os, "killpg"):
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            else:
-                proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            resp = httpx.post(f"http://localhost:{port}/shutdown", timeout=10)
+            logger.info(f"vLLM 实例 {i} (端口 {port}) 通过 /shutdown 端点关闭")
         except Exception as e:
-            logger.error(f"清理 vLLM 进程 {i} 失败: {e}")
+            logger.warning(f"vLLM /shutdown 失败，回退到进程终止: {e}")
+            try:
+                if hasattr(os, "killpg"):
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except Exception as ce:
+                logger.error(f"清理 vLLM 进程 {i} 失败: {ce}")
+
     _vllm_procs = []
     logger.info("vLLM 进程组已终止")
+
+
+def _cleanup_orphaned_enginecores() -> None:
+    """杀掉残留的 VLLM EngineCore 孤儿进程，防止显存泄漏。
+
+    当 vLLM 进程被强制杀死时，EngineCore 子进程会变成孤儿继续占显存，
+    启动新实例前需要清理这些残留进程。
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return
+
+        killed = []
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split(",")
+            if len(parts) < 2:
+                continue
+            try:
+                pid = int(parts[0].strip())
+            except ValueError:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+        if killed:
+            time.sleep(2)
+            logger.info(f"已清理残留 EngineCore 进程: {killed}")
+    except Exception as e:
+        logger.warning(f"清理残留 EngineCore 进程失败: {e}")
 
 
 def start_vllm_background():
@@ -113,6 +159,9 @@ def start_vllm_background():
     返回 (实例索引, 端口, 进程) 元组列表。
     """
     global _vllm_procs
+
+    # 启动前先清理残留的 EngineCore 孤儿进程
+    _cleanup_orphaned_enginecores()
 
     MODEL_PATH = os.environ.get("MODEL_PATH", "/root/autodl-tmp/models/Qwen2.5-0.5B")
 
@@ -154,14 +203,14 @@ def start_vllm_background():
             PYTHON_BIN, "-m", "vllm.entrypoints.openai.api_server",
             "--model", MODEL_PATH,
             "--port", str(port),
-            "--gpu-memory-utilization", "0.9",
+            "--gpu-memory-utilization", "0.75",
             "--tensor-parallel-size", str(tp_size),
             "--enable-prefix-caching",
             "--disable-log-stats",
             "--disable-uvicorn-access-log",
-            "--enable-chunked-prefill",
-            "--max-num-batched-tokens", "8192",
-            "--max-num-seqs", "256",
+            "--enforce-eager",
+            "--max-num-batched-tokens", "4096",
+            "--max-num-seqs", "128",
         ]
 
         if SPECULATIVE_MODEL:
