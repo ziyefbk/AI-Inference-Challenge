@@ -89,6 +89,35 @@ async def close_all_clients() -> None:
         _vllm_async_clients.clear()
 
 
+# ── 健康检查 ────────────────────────────────────────────────────────────
+
+async def check_vllm_healthy(url: str, timeout: float = 2.0) -> bool:
+    """检查指定 vLLM 实例是否可达。"""
+    try:
+        client = httpx.AsyncClient(timeout=timeout)
+        try:
+            resp = await client.get(f"{url}/v1/models")
+            return resp.status_code == 200
+        finally:
+            await client.aclose()
+    except Exception:
+        return False
+
+
+class VLLMUnavailableError(Exception):
+    """vLLM 服务不可用（未启动或崩溃）。"""
+    pass
+
+
+def raise_vllm_unavailable(urls: List[str]) -> None:
+    """抛出明确的 vLLM 不可用错误，列出所有尝试过的地址。"""
+    raise VLLMUnavailableError(
+        f"vLLM 服务不可用，所有实例均无法连接: {urls}。"
+        f"请确认 vLLM 进程已启动且监听对应端口。启动命令参考: "
+        f"python -m vllm.entrypoints.openai.api_server --model $MODEL_PATH --port 8000"
+    )
+
+
 # ── Chat API (generate_until 用) ────────────────────────────────────────────
 
 async def chat_completions(
@@ -189,6 +218,15 @@ async def chat_completions(
             if not err_msg or err_msg == "''":
                 err_msg = f"{type(e).__name__}"
             logger.error(f"chat_failed{body_hint}", error=err_msg)
+            # OSError (ConnectError) 全部重试失败，检查 vLLM 是否真的未启动
+            if isinstance(e, OSError) and attempt == RETRY_CONFIG["max_retries"]:
+                if not await check_vllm_healthy(chosen_url):
+                    raise VLLMUnavailableError(
+                        f"vLLM 实例 {chosen_url} 不可达（连接被拒绝）。"
+                        f"请确认 vLLM 进程已启动。启动命令: "
+                        f"python -m vllm.entrypoints.openai.api_server "
+                        f"--model {MODEL_PATH} --port {chosen_url.split(':')[-1]}"
+                    ) from e
             raise
 
 
@@ -301,4 +339,13 @@ async def completions(
             if not err_msg or err_msg == "''":
                 err_msg = f"{type(e).__name__}"
             logger.error(f"completions_failed{body_hint}", error=err_msg)
+            # OSError (ConnectError) 全部重试失败，检查 vLLM 是否真的未启动
+            if isinstance(e, OSError) and attempt == RETRY_CONFIG["max_retries"]:
+                if not await check_vllm_healthy(chosen_url):
+                    raise VLLMUnavailableError(
+                        f"vLLM 实例 {chosen_url} 不可达（连接被拒绝）。"
+                        f"请确认 vLLM 进程已启动。启动命令: "
+                        f"python -m vllm.entrypoints.openai.api_server "
+                        f"--model {MODEL_PATH} --port {chosen_url.split(':')[-1]}"
+                    ) from e
             raise

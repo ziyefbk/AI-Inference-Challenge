@@ -78,7 +78,7 @@ def log_inference(task_id: int, messages: List[Dict[str, Any]],
             "sla": sla_level,
             "eval_request_type": msg.get("eval_request_type"),
             "prompt": msg.get("prompt"),
-            "continuation": msg.get("eval_continuation"),
+            "continuation": msg.get("continuation"),
             "response": result.get("response"),
             "accuracy": result.get("accuracy"),
         })
