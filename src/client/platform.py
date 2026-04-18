@@ -143,8 +143,7 @@ def register(max_retries: int = 30, retry_interval: float = 2.0) -> bool:
             logger.warning("register_retry", attempt=attempt + 1, max_retries=max_retries, error=str(e)[:100])
             if attempt < max_retries - 1:
                 time.sleep(retry_interval)
-            else:
-                raise
+    logger.error("registration_exhausted", max_retries=max_retries)
     return False
 
 

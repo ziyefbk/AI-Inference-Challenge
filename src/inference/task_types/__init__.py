@@ -7,7 +7,7 @@
 - loglikelihood_rolling: 滚动概率计算任务
 """
 
-from src.inference.task_types.generate_until import process_generate_until, extract_final_answer
+from src.inference.task_types.generate_until import process_generate_until
 from src.inference.task_types.loglikelihood import (
     process_loglikelihood,
     process_loglikelihood_rolling,
@@ -17,7 +17,6 @@ from src.inference.task_types.loglikelihood import (
 
 __all__ = [
     "process_generate_until",
-    "extract_final_answer",
     "process_loglikelihood",
     "process_loglikelihood_rolling",
     "compute_logprob",

@@ -14,8 +14,6 @@
 import os
 import asyncio
 import concurrent.futures
-import signal
-import subprocess
 import time
 from typing import List, Dict, Any, Optional
 
@@ -25,7 +23,6 @@ from src.inference.task_types import (
     process_generate_until,
     process_loglikelihood,
     process_loglikelihood_rolling,
-    extract_final_answer,
 )
 from src.inference.strategy import (
     prepare_sla,
@@ -35,6 +32,7 @@ from src.inference.strategy import (
     load_config,
 )
 from src.utils.logger import setup_logger, get_logger
+from src.utils.process import cleanup_orphaned_enginecores as _cleanup_orphaned_enginecores
 
 setup_logger(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = get_logger("inference")
@@ -65,19 +63,62 @@ def warmup_model() -> None:
 
     logger.info("开始预热模型...")
 
-    for attempt in range(3):
+    from src.inference.vllm import get_vllm_urls
+
+    # Step 1: 等 HTTP 就绪，指数 backoff (1s -> 2s -> 4s -> ... -> 最多 30s)
+    urls = get_vllm_urls()
+    first_url = urls[0] if urls else "http://localhost:8000"
+    base_url = first_url.rstrip("/")
+
+    import httpx
+    _wait_start = time.time()
+    _wait_deadline = 300  # 最多等 5 分钟让 vLLM 启动
+    _backoff = 1.0
+    _http_ready = False
+
+    logger.info(f"等待 vLLM HTTP 端点就绪 ({base_url}/v1/models)...")
+    while time.time() - _wait_start < _wait_deadline:
+        try:
+            resp = httpx.get(f"{base_url}/v1/models", timeout=5)
+            if resp.status_code == 200:
+                _http_ready = True
+                logger.info(f"vLLM HTTP 端点就绪，耗时 {time.time() - _wait_start:.1f}s")
+                break
+        except Exception:
+            pass
+        time.sleep(_backoff)
+        _backoff = min(_backoff * 2, 30.0)
+
+    if not _http_ready:
+        logger.warning(f"等待 vLLM HTTP 端点超时 ({_wait_deadline}s)，继续 warmup（推理时会再试）")
+        _model_warmed_up = True
+        return
+
+    # Step 2: 实际 warmup，重试带上指数退避
+    _warmup_attempt = 0
+    _warmup_max = 8
+    _warmup_backoff = 5.0
+
+    while _warmup_attempt < _warmup_max:
         try:
             _do_warmup_impl()
             _model_warmed_up = True
             logger.info("预热完成")
             return
         except Exception as e:
-            logger.warning("warmup_attempt_failed", attempt=attempt + 1, error=str(e)[:150])
-            if attempt < 2:
+            _warmup_attempt += 1
+            logger.warning(
+                f"warmup_attempt_failed",
+                attempt=_warmup_attempt, max=_warmup_max,
+                error=str(e)[:100]
+            )
+            if _warmup_attempt < _warmup_max:
                 _cleanup_orphaned_enginecores()
-                time.sleep(3)
+                logger.info(f"等待 {_warmup_backoff:.0f}s 后重试 warmup...")
+                time.sleep(_warmup_backoff)
+                _warmup_backoff = min(_warmup_backoff * 1.5, 60.0)
 
-    logger.warning("预热失败，继续启动（推理时会重试）")
+    logger.warning("预热失败次数达到上限，继续启动（推理时会重试）")
     _model_warmed_up = True
 
 
@@ -115,43 +156,11 @@ def _do_warmup_impl() -> None:
         loop.close()
 
 
-def _cleanup_orphaned_enginecores() -> None:
-    """杀掉残留的 VLLM EngineCore 孤儿进程，释放显存。
-
-    在 main.py 的 main() 调用前仅做占位，启动后由 main.py 填充真实实现。
-    """
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode != 0:
-            return
-        killed = []
-        for line in result.stdout.strip().split("\n"):
-            if not line:
-                continue
-            parts = line.split(",")
-            if len(parts) < 2:
-                continue
-            try:
-                pid = int(parts[0].strip())
-                os.kill(pid, signal.SIGKILL)
-                killed.append(pid)
-            except (ValueError, ProcessLookupError, PermissionError):
-                pass
-        if killed:
-            time.sleep(2)
-            logger.info(f"已清理残留 EngineCore: {killed}")
-    except Exception:
-        pass
-
-
 # ── 指标 ─────────────────────────────────────────────────────────────
 
 from src.utils.metrics import metrics
 METRICS = metrics
-METRICS.inc_counter("inference.init")
+# METRICS.inc_counter("inference.init")
 
 
 # ── 内部处理函数 ─────────────────────────────────────────────────────────
@@ -209,7 +218,7 @@ def _aggregate_task_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any
             result = group[0]
             if not validate_result(result):
                 result["_validation_failed"] = True
-                METRICS.inc_counter("inference.validation.failed")
+                # METRICS.inc_counter("inference.validation.failed")
             out.append(result)
             continue
 
@@ -226,7 +235,7 @@ def _aggregate_task_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any
                 valid_count += 1
             else:
                 r["_validation_failed"] = True
-                METRICS.inc_counter("inference.validation.failed")
+                # METRICS.inc_counter("inference.validation.failed")
 
         # 保留第一条消息的 accuracy 作为代表性值，
         # 并附加统计元数据供监控使用
@@ -302,8 +311,8 @@ async def _process_all_async(
                 "eval_request_type": msg.get("eval_request_type", "loglikelihood"),
                 "response": None, "accuracy": None, "sla_level": effective_sla,
             })
-            METRICS.inc_counter("inference.requests",
-                              labels={"type": msg.get("eval_request_type", "loglikelihood"), "status": "error"})
+            # METRICS.inc_counter("inference.requests",
+            #                   labels={"type": msg.get("eval_request_type", "loglikelihood"), "status": "error"})
         else:
             results.append(r)
     return _aggregate_task_results(results)
