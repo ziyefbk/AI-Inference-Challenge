@@ -68,7 +68,7 @@ def _build_strategies_from_config() -> None:
             "beam_size": 1,
             "logprobs_requested": 1,
             "n": 1,
-            "max_gen_toks": 100000,
+            "max_gen_toks": 1000,
             "sampling_key": sp_key,
         }
 
@@ -157,8 +157,8 @@ def get_sla_from_deadline(
         threshold = SLA_DOWNGRADE_THRESHOLDS.get(base_sla, 1.3)
 
         if ratio < threshold:
-            from src.utils.metrics import metrics
-            metrics.inc_counter("inference.sla_downgraded", labels={"from": base_sla})
+            # from src.utils.metrics import metrics
+            # metrics.inc_counter("inference.sla_downgraded", labels={"from": base_sla})
             if ratio < 0.8:
                 if SLA_LEVELS:
                     return sorted(SLA_LEVELS.keys(), key=lambda k: SLA_LEVELS[k].get("ttft_avg", 999))[0]

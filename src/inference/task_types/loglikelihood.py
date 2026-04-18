@@ -54,14 +54,14 @@ async def compute_logprob(
 
     choices = resp.get("choices", [{}])
     if not choices:
-        metrics.inc_counter("inference.logprob_error", labels={"reason": "no_choices"})
+        # metrics.inc_counter("inference.logprob_error", labels={"reason": "no_choices"})
         return -10.0
 
     logprobs_data = choices[0].get("logprobs", {})
     lp_list: List[Any] = logprobs_data.get("token_logprobs", [])
 
     if not lp_list:
-        metrics.inc_counter("inference.logprob_error", labels={"reason": "empty_logprobs"})
+        # metrics.inc_counter("inference.logprob_error", labels={"reason": "empty_logprobs"})
         return -10.0
 
     # 定位 prompt 的 token 边界（第一个非 null 的索引 = 实际 prompt token 数）
@@ -72,7 +72,7 @@ async def compute_logprob(
             break
 
     if prompt_token_count is None:
-        metrics.inc_counter("inference.logprob_error", labels={"reason": "all_null_logprobs"})
+        # metrics.inc_counter("inference.logprob_error", labels={"reason": "all_null_logprobs"})
         return -10.0
 
     # 累加 continuation tokens 的 logprob
@@ -84,12 +84,12 @@ async def compute_logprob(
             cont_logprobs.append(float(val))
 
     if not cont_logprobs:
-        metrics.inc_counter("inference.logprob_error", labels={"reason": "no_valid_tokens"})
+        # metrics.inc_counter("inference.logprob_error", labels={"reason": "no_valid_tokens"})
         return -10.0
 
     total_logprob = float(sum(cont_logprobs))
-    metrics.observe_histogram("inference.logprob_sum", total_logprob)
-    metrics.observe_histogram("inference.logprob_value", total_logprob, labels={"type": "loglikelihood"})
+    # metrics.observe_histogram("inference.logprob_sum", total_logprob)
+    # metrics.observe_histogram("inference.logprob_value", total_logprob, labels={"type": "loglikelihood"})
 
     return total_logprob
 
@@ -126,21 +126,21 @@ async def compute_rolling_logprob(text: str) -> float:
 
     choices = resp.get("choices", [{}])
     if not choices:
-        metrics.inc_counter("inference.logprob_error", labels={"reason": "no_choices"})
+        # metrics.inc_counter("inference.logprob_error", labels={"reason": "no_choices"})
         return -10.0
 
     logprobs_data = choices[0].get("logprobs", {})
     lp_list: List[Any] = logprobs_data.get("token_logprobs", [])
 
     if not lp_list:
-        metrics.inc_counter("inference.logprob_error", labels={"reason": "empty_logprobs"})
+        # metrics.inc_counter("inference.logprob_error", labels={"reason": "empty_logprobs"})
         return -10.0
 
     valid = [float(lp) for lp in lp_list if lp is not None]
     total = float(sum(valid)) if valid else -10.0
 
     if valid:
-        metrics.observe_histogram("inference.logprob_value", total, labels={"type": "loglikelihood_rolling"})
+        # metrics.observe_histogram("inference.logprob_value", total, labels={"type": "loglikelihood_rolling"})
         return total
 
     return -10.0
@@ -165,9 +165,9 @@ async def process_loglikelihood(
     result["accuracy"] = logprob
     result["response"] = None
 
-    metrics.observe_histogram("inference.latency", elapsed, labels={"type": "loglikelihood", "sla": sla_level})
-    metrics.inc_counter("inference.requests", labels={"type": "loglikelihood", "status": "success"})
-    metrics.inc_counter("inference.tokens", len(continuation.split()), labels={"type": "loglikelihood"})
+    # metrics.observe_histogram("inference.latency", elapsed, labels={"type": "loglikelihood", "sla": sla_level})
+    # metrics.inc_counter("inference.requests", labels={"type": "loglikelihood", "status": "success"})
+    # metrics.inc_counter("inference.tokens", len(continuation.split()), labels={"type": "loglikelihood"})
 
     for k in ("eval_req_id", "eval_gen_kwargs", "eval_continuation"):
         if k in msg:
@@ -194,9 +194,9 @@ async def process_loglikelihood_rolling(
     result["accuracy"] = logprob
     result["response"] = None
 
-    metrics.observe_histogram("inference.latency", elapsed, labels={"type": "loglikelihood_rolling", "sla": sla_level})
-    metrics.inc_counter("inference.requests", labels={"type": "loglikelihood_rolling", "status": "success"})
-    metrics.inc_counter("inference.tokens", len(prompt.split()), labels={"type": "loglikelihood_rolling"})
+    # metrics.observe_histogram("inference.latency", elapsed, labels={"type": "loglikelihood_rolling", "sla": sla_level})
+    # metrics.inc_counter("inference.requests", labels={"type": "loglikelihood_rolling", "status": "success"})
+    # metrics.inc_counter("inference.tokens", len(prompt.split()), labels={"type": "loglikelihood_rolling"})
 
     for k in ("eval_req_id", "eval_gen_kwargs", "eval_continuation"):
         if k in msg:

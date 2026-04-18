@@ -164,9 +164,9 @@ async def process_generate_until(
     result["accuracy"] = None
     result["extracted_answer"] = extract_final_answer(text)
 
-    metrics.observe_histogram("inference.latency", elapsed, labels={"type": "generate_until", "sla": sla_level})
-    metrics.inc_counter("inference.requests", labels={"type": "generate_until", "status": "success"})
-    metrics.inc_counter("inference.tokens", len(text.split()), labels={"type": "generate_until"})
+    # metrics.observe_histogram("inference.latency", elapsed, labels={"type": "generate_until", "sla": sla_level})
+    # metrics.inc_counter("inference.requests", labels={"type": "generate_until", "status": "success"})
+    # metrics.inc_counter("inference.tokens", len(text.split()), labels={"type": "generate_until"})
 
     for k in ("eval_req_id", "eval_gen_kwargs", "eval_continuation"):
         if k in msg:

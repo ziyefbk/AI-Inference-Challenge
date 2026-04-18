@@ -137,7 +137,7 @@ async def main_loop() -> None:
                             tid = task.get("overview", {}).get("task_id")
                             logger.warning("task_expired", task_id=tid)
                             stats["tasks_expired"] += 1
-                            metrics.inc_counter("client.tasks.expired")
+                            # metrics.inc_counter("client.tasks.expired")
                         task_holder._check_counter = 0
                     await asyncio.sleep(0.05)
                     continue
@@ -154,8 +154,8 @@ async def main_loop() -> None:
                 if success:
                     stats["tasks_completed"] += 1
                     stats["total_inference_time"] += elapsed
-                    metrics.inc_counter("client.tasks.completed")
-                    metrics.observe_histogram("client.inference_time", elapsed)
+                    # metrics.inc_counter("client.tasks.completed")
+                    # metrics.observe_histogram("client.inference_time", elapsed)
                     log_submitted(
                         task_id=task_id,
                         result_msg_count=len(task.get("messages", [])),
@@ -165,7 +165,7 @@ async def main_loop() -> None:
                     logger.info("task_completed", task_id=task_id, elapsed=elapsed, worker_id=worker_id)
                 else:
                     stats["tasks_failed"] += 1
-                    metrics.inc_counter("client.tasks.failed")
+                    # metrics.inc_counter("client.tasks.failed")
                     log_submitted(
                         task_id=task_id,
                         result_msg_count=len(task.get("messages", [])),
@@ -251,7 +251,7 @@ async def main_loop() -> None:
                         remaining=remaining,
                         reward=target_reward,
                     )
-                    metrics.inc_counter("client.tasks.rejected_timeout_predicted")
+                    # metrics.inc_counter("client.tasks.rejected_timeout_predicted")
                     await reject_task(client, task_id, backoff, reason="timeout_predicted")
                     continue
 
