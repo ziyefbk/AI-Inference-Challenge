@@ -13,12 +13,15 @@ from src.config import Config
 
 def test_config_defaults():
     """测试默认配置值。"""
+    os.environ.setdefault("PLATFORM_URL", "http://test.local:8003")
+    os.environ.setdefault("MODEL_PATH", "/models/test")
+    os.environ.setdefault("CONFIG_PATH", "/mnt/config/contest.json")
     c = Config.__new__(Config)
     c._data = {}
     c._apply_env_overrides = lambda: None
 
     assert c.team_name == "contestant"
-    assert c.platform_url == "http://127.0.0.1:8003"
+    assert c.platform_url == "http://test.local:8003"
     assert c.vllm_timeout == 120.0
     assert c.max_concurrent_messages == 20
 
@@ -71,7 +74,7 @@ sla_levels:
         assert c.team_name == "test_team"
         assert c.platform_url == "http://test.example.com"
         assert c.model_path == "/models/test"
-        assert c.model_name == "TestModel"
+        assert c.get("model", "name") == "TestModel"
         assert c.vllm_timeout == 60.0
         assert c.max_concurrent_messages == 50
 

@@ -368,7 +368,7 @@ def start_vllm_background():
 
     _cleanup_orphaned_enginecores()
 
-    model_path = os.environ.get("MODEL_PATH", "/root/autodl-tmp/models/Qwen2.5-0.5B")
+    model_path = os.environ["MODEL_PATH"]
 
     num_gpus = 1
     try:
@@ -537,7 +537,7 @@ def main():
 
     load_config()
 
-    HTTP_PORT = int(os.environ.get("CONTESTANT_PORT", "9000"))
+    HTTP_PORT = int(os.environ["CONTESTANT_PORT"])
 
     if not args.no_vllm:
         procs = start_vllm_background()

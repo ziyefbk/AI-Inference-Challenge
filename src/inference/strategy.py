@@ -35,7 +35,7 @@ SLA_DOWNGRADE_THRESHOLDS: Dict[str, float] = {
     "express": 1.8,
 }
 
-CONFIG_PATH = os.environ.get("CONFIG_PATH", "")
+CONFIG_PATH = os.environ.get("CONFIG_PATH", "/mnt/config/contest.json")
 
 
 # ── Deep Merge ────────────────────────────────────────────────────────────

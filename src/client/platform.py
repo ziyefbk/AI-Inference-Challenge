@@ -27,7 +27,7 @@ from src.utils.logger import setup_logger, get_logger
 setup_logger(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = get_logger("client.platform")
 
-PLATFORM_URL = os.environ.get("PLATFORM_URL", "http://127.0.0.1:8003")
+PLATFORM_URL = os.environ["PLATFORM_URL"]
 TOKEN = os.environ.get("TEAM_TOKEN", "6ac07c35427ca35e69222b18b51e81b2")
 TEAM_NAME = os.environ.get("TEAM_NAME", "冤有头债有组")
 

@@ -2,8 +2,7 @@
 vLLM 调用封装模块。
 
 提供与 vLLM 服务通信的异步接口:
-- Chat Completions API (generate_text)
-- Completions API (compute_logprob, compute_rolling_logprob)
+- Completions API (/v1/completions): 用于 generate_until / loglikelihood / loglikelihood_rolling
 - 多实例负载均衡
 """
 
@@ -29,7 +28,7 @@ def interrupt_vllm_requests() -> None:
     _shutdown_interrupt = True
 
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "/root/autodl-tmp/models/Qwen2.5-0.5B")
+MODEL_PATH = os.environ["MODEL_PATH"]
 # Qwen2.5-0.5B context window = 32768, reserve headroom for prompt tokens
 MODEL_MAX_LEN = int(os.environ.get("MODEL_MAX_LEN", "1000"))
 
@@ -135,101 +134,36 @@ async def chat_completions(
     presence_penalty: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    调用 vLLM Chat Completions API。
+    调用 vLLM /v1/completions 端点实现 Chat Completions 语义。
 
-    用于 generate_until 任务（需要 chat 格式）。
+    将 system prompt 拼入 prompt，响应格式适配为 chat completions 风格。
+    用于 generate_until 任务。
     """
-    global _url_index
-    urls = get_vllm_urls()
-    chosen_url = urls[_url_index % len(urls)]
-    _url_index += 1
+    SYSTEM_PREFIX = "You are a helpful assistant.\n\n"
+    prefixed_prompt = SYSTEM_PREFIX + prompt
 
-    payload: Dict[str, Any] = {
-        "model": MODEL_PATH,
-        "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-    }
-    if top_k > 0:
-        payload["top_k"] = top_k
-    if stop is not None:
-        payload["stop"] = stop
-    if logprobs is not None:
-        payload["logprobs"] = True
-        payload["top_logprobs"] = min(logprobs, 20) if logprobs > 0 else None
-    if max_model_len is not None:
-        payload["max_model_len"] = max_model_len
-    if beam_size > 1:
-        payload["beam_size"] = beam_size
-    if repetition_penalty != 1.0:
-        payload["repetition_penalty"] = repetition_penalty
+    raw = await completions(
+        prompt=prefixed_prompt,
+        max_tokens=max_tokens,
+        logprobs=logprobs if logprobs is not None else 0,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        stop=stop,
+        repetition_penalty=repetition_penalty,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        max_model_len=max_model_len,
+        n=1,
+    )
 
-    # Clamp max_tokens to avoid vLLM 400
-    payload["max_tokens"] = min(payload["max_tokens"], MODEL_MAX_LEN)
+    choices = raw.get("choices", [])
+    if choices:
+        choice = choices[0]
+        text = choice.get("text", "")
+        choice["message"] = {"role": "assistant", "content": text}
 
-    client = await _get_client(chosen_url)
-    logger.debug("vllm_request", url=f"{chosen_url}/v1/chat/completions", payload=payload)
-
-    for attempt in range(RETRY_CONFIG["max_retries"] + 1):
-        if _shutdown_interrupt:
-            raise asyncio.CancelledError("shutdown in progress")
-        try:
-            resp = await client.post(f"{chosen_url}/v1/chat/completions", json=payload)
-            _err_body: Dict[str, Any] = {}
-            if resp.status_code == 400:
-                _err_body["vllm"] = resp.content.decode(errors="replace")
-            resp.raise_for_status()
-            result = resp.json()
-            choices = result.get("choices", [])
-            if not choices:
-                if attempt < RETRY_CONFIG["max_retries"]:
-                    logger.warning("chat_empty_choices_retry", attempt=attempt)
-                    await asyncio.sleep(0.2 * (attempt + 1))
-                    continue
-            return result
-        except asyncio.CancelledError:
-            raise
-        except (httpx.TimeoutException, httpx.HTTPStatusError, OSError) as e:
-            is_retryable = False
-            body_hint = ""
-            if isinstance(e, httpx.HTTPStatusError):
-                sc = e.response.status_code
-                is_retryable = sc >= 500 or sc == 429
-                if sc == 400:
-                    body = _err_body.get("vllm") or e.response.content.decode(errors="replace")
-                    body_hint = f" | vLLM: {body[:300] if body else 'empty'}"
-                    logger.warning("vllm_400_detail", body=body[:500] if body else "empty", payload_keys=list(payload.keys()))
-            elif isinstance(e, httpx.TimeoutException):
-                is_retryable = True
-            elif isinstance(e, OSError):
-                is_retryable = True
-
-            if is_retryable and attempt < RETRY_CONFIG["max_retries"]:
-                backoff = min(RETRY_CONFIG["backoff_factor"] ** attempt, RETRY_CONFIG["max_backoff"])
-                err_msg = str(e) if str(e) else repr(e)
-                if not err_msg or err_msg == "''":
-                    err_msg = f"{type(e).__name__}"
-                logger.warning(f"chat_retry{body_hint}", attempt=attempt + 1, error=err_msg)
-                await asyncio.sleep(backoff)
-                continue
-            err_msg = str(e) if str(e) else repr(e)
-            if not err_msg or err_msg == "''":
-                err_msg = f"{type(e).__name__}"
-            logger.error(f"chat_failed{body_hint}", error=err_msg)
-            # OSError (ConnectError) 全部重试失败，检查 vLLM 是否真的未启动
-            if isinstance(e, OSError) and attempt == RETRY_CONFIG["max_retries"]:
-                if not await check_vllm_healthy(chosen_url):
-                    raise VLLMUnavailableError(
-                        f"vLLM 实例 {chosen_url} 不可达（连接被拒绝）。"
-                        f"请确认 vLLM 进程已启动。启动命令: "
-                        f"python -m vllm.entrypoints.openai.api_server "
-                        f"--model {MODEL_PATH} --port {chosen_url.split(':')[-1]}"
-                    ) from e
-            raise
+    return raw
 
 
 # ── Completions API (loglikelihood 用) ──────────────────────────────────────
@@ -323,7 +257,7 @@ async def completions(
                 is_retryable = sc >= 500 or sc == 429
                 # Don't retry 400 - it means bad request, won't change
                 if sc == 400:
-                    body = _err_body.get("vllm") or e.response.content.decode(errors="replace")
+                    body = resp.content.decode(errors="replace")
                     body_hint = f" | vLLM: {body[:300] if body else 'empty'}"
                     logger.warning("vllm_400_detail", body=body[:500] if body else "empty", payload_keys=list(payload.keys()))
             elif isinstance(e, httpx.TimeoutException):

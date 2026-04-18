@@ -23,7 +23,7 @@ class Config:
 
     def _load(self) -> None:
         """加载配置文件。"""
-        config_path = os.environ.get("CONFIG_PATH", "")
+        config_path = os.environ.get("CONFIG_PATH", "/mnt/config/contest.json")
         if config_path and os.path.exists(config_path):
             with open(config_path) as f:
                 self._data = yaml.safe_load(f) or {}
@@ -97,12 +97,11 @@ class Config:
 
     @property
     def platform_url(self) -> str:
-        return self.get("platform", "url",
-                        default=os.environ.get("PLATFORM_URL", "http://127.0.0.1:8003"))
+        return self.get("platform", "url", default=os.environ["PLATFORM_URL"])
 
     @property
     def model_path(self) -> str:
-        return self.get("model", "path", default=os.environ.get("MODEL_PATH", ""))
+        return self.get("model", "path", default=os.environ["MODEL_PATH"])
 
     @property
     def model_name(self) -> str:
