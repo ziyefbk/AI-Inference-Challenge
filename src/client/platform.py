@@ -92,13 +92,38 @@ class BackoffState:
 
 # ── 熔断器 ─────────────────────────────────────────────────────────────
 
-_query_breaker = CircuitBreaker(name="query", failure_threshold=15, timeout=30.0)
-_ask_breaker = CircuitBreaker(name="ask", failure_threshold=10, timeout=60.0)
-_submit_breaker = CircuitBreaker(name="submit", failure_threshold=5, timeout=120.0)
+_query_breaker: Optional[CircuitBreaker] = None
+_ask_breaker: Optional[CircuitBreaker] = None
+_submit_breaker: Optional[CircuitBreaker] = None
+
+
+def _init_circuit_breakers():
+    """从配置初始化熔断器（延迟导入避免循环依赖）。"""
+    global _query_breaker, _ask_breaker, _submit_breaker
+    _query_breaker = CircuitBreaker(
+        name="query",
+        failure_threshold=config.cb_query_failure_threshold,
+        timeout=config.cb_query_timeout,
+    )
+    _ask_breaker = CircuitBreaker(
+        name="ask",
+        failure_threshold=config.cb_ask_failure_threshold,
+        timeout=config.cb_ask_timeout,
+    )
+    _submit_breaker = CircuitBreaker(
+        name="submit",
+        failure_threshold=config.cb_submit_failure_threshold,
+        timeout=config.cb_submit_timeout,
+    )
 
 
 def get_circuit_breakers() -> Dict[str, CircuitBreaker]:
+    if _query_breaker is None:
+        _init_circuit_breakers()
     return {"query": _query_breaker, "ask": _ask_breaker, "submit": _submit_breaker}
+
+
+_init_circuit_breakers()
 
 
 # ── 注册 ─────────────────────────────────────────────────────────────

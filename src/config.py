@@ -39,7 +39,6 @@ class Config:
             "TEAM_NAME": ("team", "name"),
             "PLATFORM_URL": ("platform", "url"),
             "MODEL_PATH": ("model", "path"),
-            "MODEL_NAME": ("model", "name"),
             "CONTESTANT_PORT": ("server", "port"),
             "VLLM_PORT": ("vllm", "port"),
             "MAX_CONCURRENT_MESSAGES": ("inference", "max_concurrent_messages"),
@@ -50,21 +49,31 @@ class Config:
             "SPECULATIVE_MODEL": ("speculative", "model"),
             "MAX_HELD_TASKS": ("task", "max_held"),
             "TASK_ACCEPT_TIMEOUT": ("task", "accept_timeout"),
+            "CB_QUERY_FAILURE_THRESHOLD": ("circuit_breaker", "query", "failure_threshold"),
+            "CB_QUERY_TIMEOUT": ("circuit_breaker", "query", "timeout"),
+            "CB_ASK_FAILURE_THRESHOLD": ("circuit_breaker", "ask", "failure_threshold"),
+            "CB_ASK_TIMEOUT": ("circuit_breaker", "ask", "timeout"),
+            "CB_SUBMIT_FAILURE_THRESHOLD": ("circuit_breaker", "submit", "failure_threshold"),
+            "CB_SUBMIT_TIMEOUT": ("circuit_breaker", "submit", "timeout"),
         }
-        for env_key, (section, key) in env_mappings.items():
+        for env_key, path in env_mappings.items():
             val = os.environ.get(env_key)
             if val is not None:
-                if section not in self._data:
-                    self._data[section] = {}
+                target = self._data
+                for key in path[:-1]:
+                    if key not in target:
+                        target[key] = {}
+                    target = target[key]
+                final_key = path[-1]
                 # 类型转换
-                if key in ("port", "max_retries", "timeout", "max_concurrent_messages",
-                           "max_held", "accept_timeout"):
+                if final_key in ("port", "max_retries", "timeout", "max_concurrent_messages",
+                                 "max_held", "accept_timeout", "failure_threshold"):
                     val = int(val)
-                elif key in ("enabled",):
+                elif final_key in ("enabled",):
                     val = val.lower() == "true"
-                elif key in ("token", "name", "url", "path", "model", "level"):
+                elif final_key in ("token", "name", "url", "path", "model", "level"):
                     val = str(val)
-                self._data[section][key] = val
+                target[final_key] = val
 
     def get(self, *keys: str, default: Any = None) -> Any:
         """按路径获取配置值，如 get("vllm", "timeout", default=120)。"""
@@ -97,7 +106,7 @@ class Config:
 
     @property
     def model_name(self) -> str:
-        return self.get("model", "name", default="Qwen3-32B")
+        return self.model_path
 
     @property
     def vllm_timeout(self) -> float:
@@ -106,6 +115,30 @@ class Config:
     @property
     def max_concurrent_messages(self) -> int:
         return self.get("inference", "max_concurrent_messages", default=20)
+
+    @property
+    def cb_query_failure_threshold(self) -> int:
+        return self.get("circuit_breaker", "query", "failure_threshold", default=15)
+
+    @property
+    def cb_query_timeout(self) -> float:
+        return self.get("circuit_breaker", "query", "timeout", default=30.0)
+
+    @property
+    def cb_ask_failure_threshold(self) -> int:
+        return self.get("circuit_breaker", "ask", "failure_threshold", default=10)
+
+    @property
+    def cb_ask_timeout(self) -> float:
+        return self.get("circuit_breaker", "ask", "timeout", default=60.0)
+
+    @property
+    def cb_submit_failure_threshold(self) -> int:
+        return self.get("circuit_breaker", "submit", "failure_threshold", default=15)
+
+    @property
+    def cb_submit_timeout(self) -> float:
+        return self.get("circuit_breaker", "submit", "timeout", default=120.0)
 
     def reload(self) -> None:
         """重新加载配置。"""

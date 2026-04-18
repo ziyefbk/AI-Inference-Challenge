@@ -50,13 +50,16 @@ class PriorityTaskHolder:
         if remaining < 0:
             return float("-inf")
 
+        # remaining 越大越从容，越小越紧急，所以 urgency_weight 取正数
+        # reward 越大越值得优先处理
         urgency_weight = 1.0
         complexity_penalty = msg_count * 0.3
-        reward_factor = reward / max(remaining, 1.0) * 10.0
-        sla_adjustment = {"express": -20, "fast": -10, "standard": 0, "high_quality": 5}.get(sla, 0)
+        # 奖励高且剩余时间少的任务优先
+        reward_factor = reward * 20.0 / max(remaining, 0.5)
+        sla_adjustment = {"express": -50, "fast": -20, "standard": 0, "high_quality": 10}.get(sla, 0)
 
         priority = remaining * urgency_weight + complexity_penalty - reward_factor + sla_adjustment
-        priority += random.uniform(-0.5, 0.5)
+        priority += random.uniform(-0.2, 0.2)
         return priority
 
     async def add_task(self, task: Dict[str, Any]) -> bool:
@@ -161,11 +164,22 @@ def estimate_task_duration(task: Dict[str, Any], sla_level: str) -> float:
 
 
 def estimate_task_feasible(task: Dict[str, Any], sla_level: str, buffer_factor: float = 1.3) -> bool:
+    """
+    判断任务是否可行。
+
+    策略：极度宽松。只要死线还没到就接受。
+    理由：SLA 超时提交 = 不得分不扣分，拒绝 = 必定扣分。
+    所以宁可超时完成，也不提前拒绝。
+    """
     deadline_ms = task.get("overview", {}).get("deadline_ms")
     if deadline_ms is None:
         return True
+    # deadline_ms 是任务分配时平台给的时间预算（相对于分配时刻）
+    # 乐观估计实际推理速度：Qwen2.5-0.5B 单条消息远低于 0.3s 估算
+    # 只在死线已经过了（remaining <= 0）时才拒绝
     remaining = deadline_ms / 1000.0
-    est_duration = estimate_task_duration(task, sla_level)
-    if remaining < est_duration * buffer_factor:
+    # 即使死线已过，只要绝对超时没到，提交仍可避免"未完成"扣分
+    # 这里保守一点：死线已过就认为不可行（因为推理本身需要时间）
+    if remaining <= 0.5:
         return False
     return True

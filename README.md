@@ -36,8 +36,7 @@ AI-Inference-Challenge/
 |------|------|--------|
 | `TEAM_TOKEN` | 参赛 token | — |
 | `TEAM_NAME` | 队伍名称 | contestant |
-| `MODEL_PATH` | 模型路径 | — |
-| `MODEL_NAME` | 模型名 | Qwen3-32B |
+| `MODEL_PATH` | 模型路径（同时用于 vLLM API 的 model 字段） | — |
 | `PLATFORM_URL` | 平台地址 | http://127.0.0.1:8003 |
 | `CONTESTANT_PORT` | HTTP 服务端口 | 9000 |
 | `VLLM_PORT` | vLLM 端口 | 8000 |

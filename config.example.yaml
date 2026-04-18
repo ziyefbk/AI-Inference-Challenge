@@ -4,14 +4,13 @@
 
 # ── 参赛凭证 ──────────────────────────────────────────────
 TEAM_TOKEN: ""          # 参赛 token (必填)
-TEAM_NAME: "contestant" # 队伍名称
+TEAM_NAME: "冤有头债有组" # 队伍名称
 
 # ── 平台 ──────────────────────────────────────────────────
 PLATFORM_URL: "http://127.0.0.1:8003"  # 评测平台地址
 
 # ── 模型 ──────────────────────────────────────────────────
-MODEL_PATH: ""           # 模型路径 (必填)
-MODEL_NAME: "Qwen3-32B"  # 模型名称
+MODEL_PATH: "/root/autodl-tmp/models/Qwen2.5-0.5B"  # 模型路径 (必填)，vLLM API 的 model 字段也使用此值
 
 # ── 服务端口 ───────────────────────────────────────────────
 CONTESTANT_PORT: 9000    # HTTP 健康检查端口
@@ -29,14 +28,14 @@ VLLM_MAX_CONNECTIONS: 200     # 最大连接数
 # ── 熔断器 ────────────────────────────────────────────────
 CIRCUIT_BREAKER:
   query:
-    failure_threshold: 15
-    timeout: 30.0
+    failure_threshold: 5
+    timeout: 3.0
   ask:
     failure_threshold: 10
-    timeout: 60.0
+    timeout: 5.0
   submit:
-    failure_threshold: 5
-    timeout: 120.0
+    failure_threshold: 50
+    timeout: 1.0
 
 # ── 任务持有 ──────────────────────────────────────────────
 MAX_HELD_TASKS: 64       # 最大并发持有任务数

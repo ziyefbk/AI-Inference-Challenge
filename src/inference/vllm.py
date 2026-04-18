@@ -19,7 +19,7 @@ from src.utils.logger import setup_logger, get_logger
 setup_logger(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = get_logger("inference.vllm")
 
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen3-32B")
+MODEL_PATH = os.environ.get("MODEL_PATH", "/root/autodl-tmp/models/Qwen2.5-0.5B")
 
 # 重试配置
 RETRY_CONFIG = {
@@ -104,7 +104,7 @@ async def chat_completions(
     _url_index += 1
 
     payload: Dict[str, Any] = {
-        "model": MODEL_NAME,
+        "model": MODEL_PATH,
         "messages": [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": prompt},
@@ -132,11 +132,28 @@ async def chat_completions(
         try:
             resp = await client.post(f"{chosen_url}/v1/chat/completions", json=payload)
             resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 400 and attempt < RETRY_CONFIG["max_retries"]:
-                logger.warning("chat_400_retry", attempt=attempt, text=e.response.text[:200])
-                await asyncio.sleep(0.5)
+            result = resp.json()
+            choices = result.get("choices", [])
+            if not choices:
+                if attempt < RETRY_CONFIG["max_retries"]:
+                    logger.warning("chat_empty_choices_retry", attempt=attempt)
+                    await asyncio.sleep(0.2 * (attempt + 1))
+                    continue
+            return result
+        except (httpx.TimeoutException, httpx.HTTPStatusError, OSError) as e:
+            is_retryable = False
+            if isinstance(e, httpx.HTTPStatusError):
+                sc = e.response.status_code
+                is_retryable = sc >= 500 or sc == 400 or sc == 429
+            elif isinstance(e, httpx.TimeoutException):
+                is_retryable = True
+            elif isinstance(e, OSError):
+                is_retryable = True
+
+            if is_retryable and attempt < RETRY_CONFIG["max_retries"]:
+                backoff = min(RETRY_CONFIG["backoff_factor"] ** attempt, RETRY_CONFIG["max_backoff"])
+                logger.warning("chat_retry", attempt=attempt + 1, error=str(e)[:100])
+                await asyncio.sleep(backoff)
                 continue
             raise
 
@@ -172,7 +189,7 @@ async def completions(
     _url_index += 1
 
     payload: Dict[str, Any] = {
-        "model": MODEL_NAME,
+        "model": MODEL_PATH,
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -200,10 +217,27 @@ async def completions(
         try:
             resp = await client.post(f"{chosen_url}/v1/completions", json=payload)
             resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 400 and attempt < RETRY_CONFIG["max_retries"]:
-                logger.warning("completions_400_retry", attempt=attempt, text=e.response.text[:200])
-                await asyncio.sleep(0.5)
+            result = resp.json()
+            choices = result.get("choices", [])
+            if not choices:
+                if attempt < RETRY_CONFIG["max_retries"]:
+                    logger.warning("completions_empty_choices_retry", attempt=attempt, prompt_len=len(prompt))
+                    await asyncio.sleep(0.2 * (attempt + 1))
+                    continue
+            return result
+        except (httpx.TimeoutException, httpx.HTTPStatusError, OSError) as e:
+            is_retryable = False
+            if isinstance(e, httpx.HTTPStatusError):
+                sc = e.response.status_code
+                is_retryable = sc >= 500 or sc == 400 or sc == 429
+            elif isinstance(e, httpx.TimeoutException):
+                is_retryable = True
+            elif isinstance(e, OSError):
+                is_retryable = True
+
+            if is_retryable and attempt < RETRY_CONFIG["max_retries"]:
+                backoff = min(RETRY_CONFIG["backoff_factor"] ** attempt, RETRY_CONFIG["max_backoff"])
+                logger.warning("completions_retry", attempt=attempt + 1, error=str(e)[:100])
+                await asyncio.sleep(backoff)
                 continue
             raise

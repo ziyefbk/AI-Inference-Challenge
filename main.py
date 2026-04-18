@@ -140,30 +140,28 @@ def start_vllm_background():
         else:
             PYTHON_BIN = "python3"
 
-    num_instances = max(1, num_gpus)
-    logger.info(f"检测到 {num_gpus} 张 GPU, 启动 {num_instances} 个 vLLM 实例")
+    num_instances = 1
+    tp_size = num_gpus
+    logger.info(f"检测到 {num_gpus} 张 GPU, 启动 1 个 vLLM 实例, TP={tp_size}")
 
     SPECULATIVE_MODEL = os.environ.get("SPECULATIVE_MODEL", "")
-    os.environ["VLLM_NUM_INSTANCES"] = str(num_instances)
 
     all_procs = []
     for i in range(num_instances):
-        port = 8000 + i
-        gpu_id = i if i < num_gpus else 0
+        port = 8000
 
         vllm_cmd = [
             PYTHON_BIN, "-m", "vllm.entrypoints.openai.api_server",
             "--model", MODEL_PATH,
             "--port", str(port),
             "--gpu-memory-utilization", "0.9",
-            "--tensor-parallel-size", "1",
+            "--tensor-parallel-size", str(tp_size),
             "--enable-prefix-caching",
             "--disable-log-stats",
             "--disable-uvicorn-access-log",
             "--enable-chunked-prefill",
             "--max-num-batched-tokens", "8192",
             "--max-num-seqs", "256",
-            "--ubatch-size", "256",
         ]
 
         if SPECULATIVE_MODEL:
@@ -174,7 +172,6 @@ def start_vllm_background():
             logger.info(f"实例 {i} 启用投机解码: {SPECULATIVE_MODEL}")
 
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
         proc = subprocess.Popen(
             vllm_cmd,
@@ -203,10 +200,21 @@ def start_vllm_background():
             if proc.poll() is not None:
                 stdout, stderr = proc.communicate()
                 logger.error(f"vLLM 实例 {i} 进程异常退出: {proc.returncode}")
-                if stdout:
-                    logger.error(f"stdout: {stdout.decode()[:500]}")
-                if stderr:
-                    logger.error(f"stderr: {stderr.decode()[:500]}")
+                # 写完整输出到临时文件，方便调试
+                import tempfile
+                log_path = tempfile.mktemp(suffix=f'_vllm_crash_{i}.log', prefix='/tmp/')
+                try:
+                    with open(log_path, 'w', encoding='utf-8', errors='replace') as f:
+                        if stdout:
+                            f.write("=== STDOUT ===\n")
+                            f.write(stdout.decode(errors='replace'))
+                        f.write("\n=== STDERR ===\n")
+                        if stderr:
+                            f.write(stderr.decode(errors='replace'))
+                    logger.error(f"完整输出已写入: {log_path}")
+                    logger.error(f"查看命令: cat {log_path}")
+                except Exception as le:
+                    logger.error(f"写日志文件失败: {le}")
                 break
 
             try:
@@ -266,16 +274,11 @@ class HealthHandler(BaseHTTPRequestHandler):
             self._send_json(503, {"status": "not_ready", "vllm": "error"})
 
     def _check_vllm(self) -> bool:
-        num_instances = int(os.environ.get("VLLM_NUM_INSTANCES", "1"))
-        for i in range(num_instances):
-            port = 8000 + i
-            try:
-                resp = httpx.get(f"http://localhost:{port}/v1/models", timeout=2)
-                if resp.status_code == 200:
-                    return True
-            except Exception:
-                continue
-        return False
+        try:
+            resp = httpx.get("http://localhost:8000/v1/models", timeout=2)
+            return resp.status_code == 200
+        except Exception:
+            return False
 
     def _handle_metrics(self):
         self.send_response(200)

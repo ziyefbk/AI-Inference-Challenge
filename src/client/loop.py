@@ -101,13 +101,11 @@ async def main_loop() -> None:
     if num_gpus > 1:
         num_workers = min(base_workers + num_gpus * 3, 32)
         prefetch_size = base_prefetch * 3
-        os.environ["VLLM_NUM_INSTANCES"] = str(num_gpus)
         os.environ["MAX_CONCURRENT_MESSAGES"] = str(min(32, 16 + num_gpus * 2))
         logger.info("multi_gpu_config", num_gpus=num_gpus, num_workers=num_workers, prefetch_size=prefetch_size)
     else:
         num_workers = base_workers
         prefetch_size = base_prefetch
-        os.environ["VLLM_NUM_INSTANCES"] = "1"
         logger.info("single_gpu_config", num_workers=num_workers, prefetch_size=prefetch_size)
 
     async with httpx.AsyncClient(timeout=60, limits=CLIENT_LIMITS) as client:
@@ -220,7 +218,7 @@ async def main_loop() -> None:
                     task_id=task_id,
                     sla=target_sla,
                     reward=target_reward,
-                    msg_count=0,
+                    msg_count=len(task_overview.get("messages", [])),
                     deadline_ms=deadline_ms,
                 )
 
