@@ -16,7 +16,6 @@ from src.client.platform import (
     process_task,
 )
 from src.client.task_holder import PriorityTaskHolder
-from src.client.monitor import init_monitor, log_queried, log_submitted, log_inference
 
 __all__ = [
     "main_loop",
@@ -29,8 +28,4 @@ __all__ = [
     "reject_task",
     "submit_results",
     "process_task",
-    "init_monitor",
-    "log_queried",
-    "log_submitted",
-    "log_inference",
 ]

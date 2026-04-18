@@ -345,7 +345,6 @@ async def process_task(
 ) -> bool:
     """处理单个任务: 运行推理并提交结果。"""
     from src.inference import run_inference_async
-    from src.client.monitor import log_inference
 
     messages = task.get("messages", [])
     if not messages:
@@ -360,8 +359,6 @@ async def process_task(
 
     logger.info("inference_start", task_id=task_id, msg_count=len(messages), sla=sla_level or "auto")
     results = await run_inference_async(messages, sla_level=sla_level, deadline_ms=deadline_ms)
-
-    log_inference(task_id, messages, results, sla_level or "auto")
 
     task_data = {
         "overview": overview,

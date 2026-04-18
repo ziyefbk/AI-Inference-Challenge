@@ -24,7 +24,6 @@ from src.client.platform import (
     process_task,
 )
 from src.client.task_holder import PriorityTaskHolder, estimate_task_feasible
-from src.client.monitor import init_monitor, log_queried, log_submitted
 from src.inference.vllm import interrupt_vllm_requests
 from src.utils.logger import setup_logger, get_logger
 from src.utils.graceful import shutdown_manager
@@ -65,9 +64,6 @@ async def main_loop() -> None:
     """主客户端循环。"""
     shutdown_manager.register_handler()
     shutdown_manager.on_shutdown_begin(interrupt_vllm_requests)
-
-    init_monitor()
-    logger.info("monitor_initialized")
 
     checkpoint = load_checkpoint()
     if checkpoint:
@@ -156,22 +152,10 @@ async def main_loop() -> None:
                     stats["total_inference_time"] += elapsed
                     # metrics.inc_counter("client.tasks.completed")
                     # metrics.observe_histogram("client.inference_time", elapsed)
-                    log_submitted(
-                        task_id=task_id,
-                        result_msg_count=len(task.get("messages", [])),
-                        sla=sla_level,
-                        success=True,
-                    )
                     logger.info("task_completed", task_id=task_id, elapsed=elapsed, worker_id=worker_id, bucket=bucket)
                 else:
                     stats["tasks_failed"] += 1
                     # metrics.inc_counter("client.tasks.failed")
-                    log_submitted(
-                        task_id=task_id,
-                        result_msg_count=len(task.get("messages", [])),
-                        sla=sla_level,
-                        success=False,
-                    )
                     logger.error("task_failed", task_id=task_id, elapsed=elapsed, bucket=bucket)
 
                 if time.time() - last_checkpoint > 60:
@@ -234,14 +218,6 @@ async def main_loop() -> None:
                 target_sla = task_overview.get("target_sla", "standard")
                 target_reward = task_overview.get("target_reward", 1.0)
                 deadline_ms = task_overview.get("deadline_ms")
-
-                log_queried(
-                    task_id=task_id,
-                    sla=target_sla,
-                    reward=target_reward,
-                    msg_count=len(task_overview.get("messages", [])),
-                    deadline_ms=deadline_ms,
-                )
 
                 temp_task = {"overview": task_overview, "messages": task_overview.get("messages", [])}
                 if not estimate_task_feasible(temp_task, target_sla):
