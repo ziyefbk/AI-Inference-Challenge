@@ -293,7 +293,7 @@ def _wait_for_instance(
         # HTTP 200 后，发一个实际推理探测确认模型真正可用
         # 用 /v1/completions 而非 /v1/chat/completions，因为后者可能不存在
         probe_ok = False
-        for probe_attempt in range(3):
+        for probe_attempt in range(10):
             if proc.poll() is not None:
                 stderr_bytes = capture.get_output()
                 category = _classify_vllm_error(stderr_bytes)
@@ -317,7 +317,7 @@ def _wait_for_instance(
                     break
                 elif probe_resp.status_code >= 500:
                     logger.warning(
-                        f"vLLM 实例 {i} 推理探测返回 {probe_resp.status_code}，等待 2s 后重试 ({probe_attempt + 1}/3)"
+                        f"vLLM 实例 {i} 推理探测返回 {probe_resp.status_code}，等待 2s 后重试 ({probe_attempt + 1}/10)"
                     )
             except Exception:
                 pass
@@ -390,7 +390,7 @@ def start_vllm_background():
 
     num_instances = 1
     tp_size = num_gpus
-    restart_max = 2
+    restart_max = 10
     max_wait = 90
 
     logger.info(
