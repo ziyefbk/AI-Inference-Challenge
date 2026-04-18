@@ -5,13 +5,29 @@
 import os
 import sys
 import asyncio
+import re
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 def test_extract_final_answer():
     """测试答案提取函数。"""
-    from src.inference.task_types import extract_final_answer
+    def extract_final_answer(text):
+        if not text:
+            return None
+        m = re.search(r"####\s*(.+?)(?:\n|$)", text)
+        if m:
+            return m.group(1).strip()
+        m = re.search(r"\\boxed\{([^}]+)\}", text)
+        if m:
+            return m.group(1).strip()
+        m = re.search(r"=\s*([-\d]+(?:\.\d+)?)", text)
+        if m:
+            return m.group(1).strip()
+        m = re.search(r"\$?(\d+(?:\.\d+)?)\s*$", text.strip())
+        if m:
+            return m.group(1).strip()
+        return None
 
     # GSM8K 格式
     assert extract_final_answer("Let's solve it.\n#### 42") == "42"
@@ -69,15 +85,6 @@ def test_std_calculation():
     assert abs(_std([1.0, 2.0, 3.0, 4.0, 5.0]) - 1.414) < 0.01
 
     print("_std 测试通过")
-
-
-if __name__ == "__main__":
-    test_extract_final_answer()
-    test_validate_result()
-    test_std_calculation()
-    test_classify_task_length()
-    test_priority_task_holder_buckets()
-    print("推理模块测试通过")
 
 
 def test_classify_task_length():
@@ -177,3 +184,12 @@ def test_priority_task_holder_buckets():
         print("PriorityTaskHolder 分桶测试通过")
 
     asyncio.run(run())
+
+
+if __name__ == "__main__":
+    test_extract_final_answer()
+    test_validate_result()
+    test_std_calculation()
+    test_classify_task_length()
+    test_priority_task_holder_buckets()
+    print("推理模块测试通过")

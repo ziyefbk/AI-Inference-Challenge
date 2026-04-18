@@ -3,27 +3,27 @@
 # ─────────────────────────────────────────────────────────────
 
 # ── 参赛凭证 ──────────────────────────────────────────────
-TEAM_TOKEN: ""          # 参赛 token (必填)
-TEAM_NAME: "冤有头债有组" # 队伍名称
+TEAM_TOKEN: "6ac07c35427ca35e69222b18b51e81b2"          # 参赛 token (必填)
+TEAM_NAME: "冤有头债有组"                                 # 队伍名称
 
 # ── 平台 ──────────────────────────────────────────────────
-PLATFORM_URL: "http://127.0.0.1:8003"  # 评测平台地址
+PLATFORM_URL: "http://127.0.0.1:8003"                   # 评测平台地址
 
 # ── 模型 ──────────────────────────────────────────────────
-MODEL_PATH: "/root/autodl-tmp/models/Qwen2.5-0.5B"  # 模型路径 (必填)，vLLM API 的 model 字段也使用此值
+MODEL_PATH: "/root/autodl-tmp/models/Qwen2.5-0.5B"     # 模型路径 (必填)
 
 # ── 服务端口 ───────────────────────────────────────────────
-CONTESTANT_PORT: 9000    # HTTP 健康检查端口
-VLLM_PORT: 8000          # vLLM 推理端口起始
+CONTESTANT_PORT: 9000                                   # HTTP 健康检查端口
+VLLM_PORT: 8000                                         # vLLM 推理端口起始
 
 # ── 并发与重试 ────────────────────────────────────────────
-MAX_CONCURRENT_MESSAGES: 20    # 最大并发消息数
-VLLM_MAX_RETRIES: 3           # vLLM 请求最大重试次数
-VLLM_BACKOFF_FACTOR: 1.5       # 退避因子
-VLLM_MAX_BACKOFF: 30.0        # 最大退避时间(秒)
-VLLM_TIMEOUT: 120.0           # 请求超时(秒)
-VLLM_MAX_KEEPALIVE: 100       # keepalive 连接数
-VLLM_MAX_CONNECTIONS: 200     # 最大连接数
+MAX_CONCURRENT_MESSAGES: 20                             # 最大并发消息数
+VLLM_MAX_RETRIES: 3                                    # vLLM 请求最大重试次数
+VLLM_BACKOFF_FACTOR: 1.5                                # 退避因子
+VLLM_MAX_BACKOFF: 30.0                                  # 最大退避时间(秒)
+VLLM_TIMEOUT: 120.0                                     # 请求超时(秒)
+VLLM_MAX_KEEPALIVE: 100                                 # keepalive 连接数
+VLLM_MAX_CONNECTIONS: 200                               # 最大连接数
 
 # ── 熔断器 ────────────────────────────────────────────────
 CIRCUIT_BREAKER:
@@ -38,60 +38,110 @@ CIRCUIT_BREAKER:
     timeout: 1.0
 
 # ── 任务持有 ──────────────────────────────────────────────
-MAX_HELD_TASKS: 64       # 最大并发持有任务数
-TASK_ACCEPT_TIMEOUT: 300  # 任务领取超时(秒)
+MAX_HELD_TASKS: 64                                      # 最大并发持有任务数
+TASK_ACCEPT_TIMEOUT: 300                                # 任务领取超时(秒)
 
 # ── 预热 ──────────────────────────────────────────────────
 WARMUP_ENABLED: true
 WARMUP_REQUESTS: 5
 
 # ── 推理参数 ──────────────────────────────────────────────
+# 字段名与 defination_base.json 完全对齐: penalty_repetition / penalty_frequency / penalty_presence
 sampling_params:
   Deterministic:
     temperature: 0.0
     top_p: 1.0
     top_k: 1
-    repetition_penalty: 1.0
+    penalty_repetition: 1.0
+    penalty_frequency: 0.0
+    penalty_presence: 0.0
   Normal:
     temperature: 0.1
     top_p: 0.9
     top_k: 50
-    repetition_penalty: 1.1
-    frequency_penalty: 0.2
+    penalty_repetition: 1.1
+    penalty_frequency: 0.2
+    penalty_presence: 0.2
   HighEntropy:
-    temperature: 0.3
+    temperature: 0.1
     top_p: 0.95
     top_k: 100
-    repetition_penalty: 1.2
+    penalty_repetition: 1.05
+    penalty_frequency: 0.0
+    penalty_presence: 0.0
   ExtremePenalty:
     temperature: 0.1
     top_p: 0.9
-    top_k: 50
-    repetition_penalty: 1.5
+    top_k: 20
+    penalty_repetition: 1.8
+    penalty_frequency: 1.2
+    penalty_presence: 1.2
 
+# ── SLA 级别 ───────────────────────────────────────────────
+# 与 defination_base.json 的 SLA 字段对齐 (Bronze → Supreme)
+# ttft_avg: 该 SLA 级别的目标平均首 token 时间(秒)
+# tpot_p50 / tpot_p75: 每 token 延迟百分位数(秒)
 sla_levels:
-  express:
+  Bronze:
+    ttft_avg: 10
+    tpot_p50: 1
+    tpot_p75: 2
+  Silver:
+    ttft_avg: 8
+    tpot_p50: 0.8
+    tpot_p75: 1.6
+  Gold:
+    ttft_avg: 6
+    tpot_p50: 0.4
+    tpot_p75: 0.8
+  Platinum:
+    ttft_avg: 4
+    tpot_p50: 0.2
+    tpot_p75: 0.4
+  Diamond:
+    ttft_avg: 2
+    tpot_p50: 0.1
+    tpot_p75: 0.2
+  Stellar:
+    ttft_avg: 1.5
+    tpot_p50: 0.08
+    tpot_p75: 0.16
+  Glorious:
+    ttft_avg: 0.8
+    tpot_p50: 0.04
+    tpot_p75: 0.04
+  Supreme:
     ttft_avg: 0.5
-    description: "极速选择题"
-  fast:
-    ttft_avg: 2.0
-    description: "短答案"
-  standard:
-    ttft_avg: 5.0
-    description: "常规推理"
-  high_quality:
-    ttft_avg: 15.0
-    description: "复杂推理"
+    tpot_p50: 0.02
+    tpot_p75: 0.01
 
+# ── SLA 降级阈值 ─────────────────────────────────────────
+# deadline / estimated_duration 比值低于此阈值时触发 SLA 降级
 sla_downgrade_thresholds:
+  Bronze: 3.0
+  Silver: 2.6
+  Gold: 1.8
+  Platinum: 1.4
+  Diamond: 1.2
+  Stellar: 1.16
+  Glorious: 1.08
+  Supreme: 1.04
   high_quality: 1.2
   standard: 1.3
   fast: 1.5
   express: 1.8
 
+# ── 任务长度分桶 ─────────────────────────────────────────
+# 与 defination_base.json 的 LenSpec 对齐
+len_spec:
+  Small: [0, 128]
+  Medium: [128, 256]
+  Large: [256, 512]
+  XL: [512, 1024]
+
 # ── 日志 ──────────────────────────────────────────────────
 LOG_LEVEL: "INFO"
 
 # ── 投机解码 ──────────────────────────────────────────────
-SPECULATIVE_MODEL: ""    # 留空则不启用
+SPECULATIVE_MODEL: ""                                    # 留空则不启用
 SPECULATIVE_DRAFT_TOKENS: 4

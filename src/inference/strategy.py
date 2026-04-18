@@ -2,14 +2,21 @@
 SLA 策略管理模块。
 
 管理不同 SLA 级别的采样策略，支持:
-- 配置加载
+- 配置加载（CONFIG_PATH → 内置基准 → config.example.yaml，三级兜底）
+- Deep merge: contest.json 覆盖 defination_base.json 基准字段
 - 动态 SLA 降级
 - 自适应策略选择
+
+字段名约定: penalty_repetition / penalty_frequency / penalty_presence
+（与 defination_base.json / contest.json / config.example.yaml 保持一致）
 """
 
 import os
 import json
+import copy
 from typing import Dict, Any, Optional, List
+
+import yaml
 
 from src.utils.logger import setup_logger, get_logger
 
@@ -27,29 +34,182 @@ SLA_DOWNGRADE_THRESHOLDS: Dict[str, float] = {
     "fast": 1.5,
     "express": 1.8,
 }
+
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "")
+
+
+# ── Deep Merge ────────────────────────────────────────────────────────────
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    深度合并两字典: override 覆盖 base，递归合并嵌套 dict。
+    """
+    result = copy.deepcopy(base)
+    for key, value in override.items():
+        if (
+            key in result
+            and isinstance(result[key], dict)
+            and isinstance(value, dict)
+        ):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+# ── 内置基准默认值 ───────────────────────────────────────────────────────
+
+_BUILTIN_DEFINITION_BASE: Dict[str, Any] = {
+    "LenSpec": {
+        "Small": [0, 128],
+        "Medium": [128, 256],
+        "Large": [256, 512],
+        "XL": [512, 1024],
+    },
+    "SamplingParam": {
+        "Deterministic": {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 1,
+            "penalty_repetition": 1.0,
+            "penalty_frequency": 0.0,
+            "penalty_presence": 0.0,
+        },
+        "Normal": {
+            "temperature": 0.1,
+            "top_p": 0.9,
+            "top_k": 50,
+            "penalty_repetition": 1.1,
+            "penalty_frequency": 0.2,
+            "penalty_presence": 0.2,
+        },
+        "HighEntropy": {
+            "temperature": 0.1,
+            "top_p": 0.95,
+            "top_k": 100,
+            "penalty_repetition": 1.05,
+            "penalty_frequency": 0.0,
+            "penalty_presence": 0.0,
+        },
+        "ExtremePenalty": {
+            "temperature": 0.1,
+            "top_p": 0.9,
+            "top_k": 20,
+            "penalty_repetition": 1.8,
+            "penalty_frequency": 1.2,
+            "penalty_presence": 1.2,
+        },
+    },
+    "SLA": {
+        "Bronze": {"ttft_avg": 10, "tpot_p50": 1, "tpot_p75": 2},
+        "Silver": {"ttft_avg": 8, "tpot_p50": 0.8, "tpot_p75": 1.6},
+        "Gold": {"ttft_avg": 6, "tpot_p50": 0.4, "tpot_p75": 0.8},
+        "Platinum": {"ttft_avg": 4, "tpot_p50": 0.2, "tpot_p75": 0.4},
+        "Diamond": {"ttft_avg": 2, "tpot_p50": 0.1, "tpot_p75": 0.2},
+        "Stellar": {"ttft_avg": 1.5, "tpot_p50": 0.08, "tpot_p75": 0.16},
+        "Glorious": {"ttft_avg": 0.8, "tpot_p50": 0.04, "tpot_p75": 0.04},
+        "Supreme": {"ttft_avg": 0.5, "tpot_p50": 0.02, "tpot_p75": 0.01},
+    },
+}
 
 
 # ── 配置加载 ─────────────────────────────────────────────────────────────
 
 def load_config() -> None:
+    """
+    加载比赛规则配置，支持三级兜底:
+
+    1. CONFIG_PATH  (contest.json, JSON 格式)
+       ↓ 深度合并 (覆盖基准)
+    2. 内置 _BUILTIN_DEFINITION_BASE (等同于 defination_base.json)
+       ↓ 深度合并 (填充缺失字段)
+    3. config.example.yaml  (YAML 格式, penalty_* 字段名)
+    4. 内置默认值 (仍不足时兜底)
+
+    加载顺序优先级: CONFIG_PATH > defination_base > config.example.yaml > 内置默认值
+    """
     global SAMPLING_PARAMS, SLA_LEVELS, SLA_STRATEGIES, SLA_DOWNGRADE_THRESHOLDS
-    if not CONFIG_PATH or not os.path.exists(CONFIG_PATH):
-        _build_default_strategies()
-        return
-    with open(CONFIG_PATH) as f:
-        config = json.load(f)
-    if "sampling_params" in config:
-        SAMPLING_PARAMS = config["sampling_params"]
-    if "sla_levels" in config:
-        SLA_LEVELS = config["sla_levels"]
-    if "sla_downgrade_thresholds" in config:
-        SLA_DOWNGRADE_THRESHOLDS = config["sla_downgrade_thresholds"]
+
+    # 1. 从 CONFIG_PATH 加载 (JSON)，与内置基准做 deep merge
+    base_config: Dict[str, Any] = {}
+    if CONFIG_PATH and os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                contest_override = json.load(f)
+            base_config = _deep_merge(_BUILTIN_DEFINITION_BASE, contest_override)
+            logger.info("Loaded config from CONFIG_PATH", path=CONFIG_PATH)
+        except Exception as e:
+            logger.warning("Failed to load CONFIG_PATH, falling back", path=CONFIG_PATH, error=str(e))
+            base_config = copy.deepcopy(_BUILTIN_DEFINITION_BASE)
+    else:
+        base_config = copy.deepcopy(_BUILTIN_DEFINITION_BASE)
+
+    # 2. 从 base_config["SLA"] 推导 SLA_LEVELS 和降级阈值
+    _derive_sla_config(base_config)
+
+    # 3. 尝试加载 config.example.yaml (YAML 优先级最低，只补充缺失字段)
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    example_yaml_path = os.path.join(project_root, "config.example.yaml")
+    if os.path.exists(example_yaml_path):
+        try:
+            with open(example_yaml_path) as f:
+                yaml_config = yaml.safe_load(f) or {}
+            if "sla_downgrade_thresholds" in yaml_config:
+                for key, val in yaml_config["sla_downgrade_thresholds"].items():
+                    if key not in SLA_DOWNGRADE_THRESHOLDS:
+                        SLA_DOWNGRADE_THRESHOLDS[key] = val
+        except Exception as e:
+            logger.warning("Failed to load config.example.yaml", path=example_yaml_path, error=str(e))
+
+    # 4. 若仍无 sampling_params，使用内置兜底
+    if not SAMPLING_PARAMS:
+        SAMPLING_PARAMS = {
+            "Deterministic": {
+                "temperature": 0.0, "top_p": 1.0, "top_k": 1,
+                "penalty_repetition": 1.0, "penalty_frequency": 0.0, "penalty_presence": 0.0,
+            },
+            "Normal": {
+                "temperature": 0.1, "top_p": 0.9, "top_k": 50,
+                "penalty_repetition": 1.1, "penalty_frequency": 0.2, "penalty_presence": 0.2,
+            },
+            "HighEntropy": {
+                "temperature": 0.1, "top_p": 0.95, "top_k": 100,
+                "penalty_repetition": 1.05, "penalty_frequency": 0.0, "penalty_presence": 0.0,
+            },
+            "ExtremePenalty": {
+                "temperature": 0.1, "top_p": 0.9, "top_k": 20,
+                "penalty_repetition": 1.8, "penalty_frequency": 1.2, "penalty_presence": 1.2,
+            },
+        }
+
     _build_strategies_from_config()
 
 
+def _derive_sla_config(base_config: Dict[str, Any]) -> None:
+    """
+    从 base_config["SLA"] 填充 SLA_LEVELS 和 SLA_DOWNGRADE_THRESHOLDS。
+    从 base_config["SamplingParam"] 补全 SAMPLING_PARAMS。
+    """
+    global SLA_LEVELS, SLA_DOWNGRADE_THRESHOLDS, SAMPLING_PARAMS
+
+    if "SLA" in base_config:
+        for sla_name, sla_params in base_config["SLA"].items():
+            SLA_LEVELS[sla_name] = sla_params
+            tpot_p50 = sla_params.get("tpot_p50", 0.3)
+            if sla_name not in SLA_DOWNGRADE_THRESHOLDS:
+                SLA_DOWNGRADE_THRESHOLDS[sla_name] = round(1.0 + tpot_p50 * 2, 2)
+
+    if "SamplingParam" in base_config:
+        for name, params in base_config["SamplingParam"].items():
+            if name not in SAMPLING_PARAMS:
+                SAMPLING_PARAMS[name] = params
+
+
+# ── 构建策略表 ────────────────────────────────────────────────────────────
+
 def _build_strategies_from_config() -> None:
-    """从配置文件构建 SLA_STRATEGIES。"""
+    """从当前 SAMPLING_PARAMS 和 SLA_LEVELS 构建 SLA_STRATEGIES。"""
     global SLA_STRATEGIES
     sampling_keys = ["Deterministic", "Normal", "HighEntropy", "ExtremePenalty"]
     sla_keys = list(SLA_LEVELS.keys())
@@ -62,9 +222,9 @@ def _build_strategies_from_config() -> None:
             "temperature": sp.get("temperature", 0.1),
             "top_p": sp.get("top_p", 0.9),
             "top_k": int(sp.get("top_k", 50)),
-            "repetition_penalty": sp.get("repetition_penalty", 1.0),
-            "frequency_penalty": sp.get("frequency_penalty", 0.0),
-            "presence_penalty": sp.get("presence_penalty", 0.0),
+            "repetition_penalty": sp.get("penalty_repetition", sp.get("repetition_penalty", 1.0)),
+            "frequency_penalty": sp.get("penalty_frequency", sp.get("frequency_penalty", 0.0)),
+            "presence_penalty": sp.get("penalty_presence", sp.get("presence_penalty", 0.0)),
             "beam_size": 1,
             "logprobs_requested": 1,
             "n": 1,
@@ -74,7 +234,7 @@ def _build_strategies_from_config() -> None:
 
 
 def _build_default_strategies() -> None:
-    """配置文件不存在时的兜底策略。"""
+    """配置文件不存在时的兜底策略（仅在加载完全失败时使用）。"""
     global SLA_STRATEGIES, SLA_LEVELS
     SLA_LEVELS = {
         "express": {"ttft_avg": 0.5},
@@ -157,8 +317,6 @@ def get_sla_from_deadline(
         threshold = SLA_DOWNGRADE_THRESHOLDS.get(base_sla, 1.3)
 
         if ratio < threshold:
-            # from src.utils.metrics import metrics
-            # metrics.inc_counter("inference.sla_downgraded", labels={"from": base_sla})
             if ratio < 0.8:
                 if SLA_LEVELS:
                     return sorted(SLA_LEVELS.keys(), key=lambda k: SLA_LEVELS[k].get("ttft_avg", 999))[0]
@@ -197,13 +355,16 @@ def get_adaptive_sla_strategy(
     return get_sla_strategy(final_sla)
 
 
-# 事件 SLA 字段到内部策略 key 的映射
+# 比赛 SLA 级别名称 → 内部采样策略 key 的映射
 SLA_LEVEL_TO_STRATEGY: Dict[str, str] = {
     "Bronze": "standard",
     "Silver": "standard",
     "Gold": "standard",
-    "Diamond": "standard",
     "Platinum": "standard",
+    "Diamond": "high_quality",
+    "Stellar": "high_quality",
+    "Glorious": "express",
+    "Supreme": "express",
 }
 
 
