@@ -4,15 +4,9 @@ loglikelihood 任务处理器。
 计算 log P(continuation | prompt)，用于选择题、是非题等判断任务。
 """
 
-import time
 from typing import Dict, Any, Optional, List
 
 from src.inference.vllm import completions
-from src.inference.strategy import get_sla_strategy, get_adaptive_sla_strategy
-from src.utils.logger import get_logger
-from src.utils.metrics import metrics
-
-logger = get_logger("inference.tasks.loglikelihood")
 
 
 async def compute_logprob(
@@ -54,14 +48,12 @@ async def compute_logprob(
 
     choices = resp.get("choices", [{}])
     if not choices:
-        # metrics.inc_counter("inference.logprob_error", labels={"reason": "no_choices"})
         return -10.0
 
     logprobs_data = choices[0].get("logprobs", {})
     lp_list: List[Any] = logprobs_data.get("token_logprobs", [])
 
     if not lp_list:
-        # metrics.inc_counter("inference.logprob_error", labels={"reason": "empty_logprobs"})
         return -10.0
 
     # 定位 prompt 的 token 边界（第一个非 null 的索引 = 实际 prompt token 数）
@@ -72,7 +64,6 @@ async def compute_logprob(
             break
 
     if prompt_token_count is None:
-        # metrics.inc_counter("inference.logprob_error", labels={"reason": "all_null_logprobs"})
         return -10.0
 
     # 累加 continuation tokens 的 logprob
@@ -84,14 +75,9 @@ async def compute_logprob(
             cont_logprobs.append(float(val))
 
     if not cont_logprobs:
-        # metrics.inc_counter("inference.logprob_error", labels={"reason": "no_valid_tokens"})
         return -10.0
 
-    total_logprob = float(sum(cont_logprobs))
-    # metrics.observe_histogram("inference.logprob_sum", total_logprob)
-    # metrics.observe_histogram("inference.logprob_value", total_logprob, labels={"type": "loglikelihood"})
-
-    return total_logprob
+    return float(sum(cont_logprobs))
 
 
 async def compute_rolling_logprob(text: str) -> float:
@@ -107,9 +93,6 @@ async def compute_rolling_logprob(text: str) -> float:
             lp_list[0] = null
             lp_list[1..N] = logP(t_1), logP(t_2 | t_1), ..., logP(t_N | t_1..t_{N-1})
         累加 lp_list[1:] 即为所求。
-
-        注意：旧实现用 max_tokens=1，lp_list[1:] 会多包含 1 个生成的 token，
-        导致结果偏大。
     """
     if not text:
         return 0.0
@@ -126,24 +109,16 @@ async def compute_rolling_logprob(text: str) -> float:
 
     choices = resp.get("choices", [{}])
     if not choices:
-        # metrics.inc_counter("inference.logprob_error", labels={"reason": "no_choices"})
         return -10.0
 
     logprobs_data = choices[0].get("logprobs", {})
     lp_list: List[Any] = logprobs_data.get("token_logprobs", [])
 
     if not lp_list:
-        # metrics.inc_counter("inference.logprob_error", labels={"reason": "empty_logprobs"})
         return -10.0
 
     valid = [float(lp) for lp in lp_list if lp is not None]
-    total = float(sum(valid)) if valid else -10.0
-
-    if valid:
-        # metrics.observe_histogram("inference.logprob_value", total, labels={"type": "loglikelihood_rolling"})
-        return total
-
-    return -10.0
+    return float(sum(valid)) if valid else -10.0
 
 
 async def process_loglikelihood(
@@ -157,17 +132,10 @@ async def process_loglikelihood(
     continuation = msg.get("eval_continuation", "")
 
     result = {"ID": msg_id, "prompt": prompt, "eval_request_type": "loglikelihood"}
-    msg_start = time.time()
 
     logprob = await compute_logprob(prompt, continuation)
-    elapsed = time.time() - msg_start
-
     result["accuracy"] = logprob
     result["response"] = None
-
-    # metrics.observe_histogram("inference.latency", elapsed, labels={"type": "loglikelihood", "sla": sla_level})
-    # metrics.inc_counter("inference.requests", labels={"type": "loglikelihood", "status": "success"})
-    # metrics.inc_counter("inference.tokens", len(continuation.split()), labels={"type": "loglikelihood"})
 
     for k in ("eval_req_id", "eval_gen_kwargs", "eval_continuation"):
         if k in msg:
@@ -186,17 +154,10 @@ async def process_loglikelihood_rolling(
     prompt = msg["prompt"]
 
     result = {"ID": msg_id, "prompt": prompt, "eval_request_type": "loglikelihood_rolling"}
-    msg_start = time.time()
 
     logprob = await compute_rolling_logprob(prompt)
-    elapsed = time.time() - msg_start
-
     result["accuracy"] = logprob
     result["response"] = None
-
-    # metrics.observe_histogram("inference.latency", elapsed, labels={"type": "loglikelihood_rolling", "sla": sla_level})
-    # metrics.inc_counter("inference.requests", labels={"type": "loglikelihood_rolling", "status": "success"})
-    # metrics.inc_counter("inference.tokens", len(prompt.split()), labels={"type": "loglikelihood_rolling"})
 
     for k in ("eval_req_id", "eval_gen_kwargs", "eval_continuation"):
         if k in msg:
