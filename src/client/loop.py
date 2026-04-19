@@ -19,7 +19,6 @@ from src.client.platform import (
     get_circuit_breakers,
     query_task,
     accept_task,
-    reject_task,
     register,
     process_task,
 )
@@ -131,9 +130,14 @@ async def main_loop() -> None:
                         expired = await task_holder.get_expired()
                         for task, _ in expired:
                             tid = task.get("overview", {}).get("task_id")
-                            logger.warning("task_expired", task_id=tid)
-                            stats["tasks_expired"] += 1
-                            # metrics.inc_counter("client.tasks.expired")
+                            overview = task.get("overview", {})
+                            success = await process_task(client, task, backoff, overview.get("target_sla"))
+                            if success:
+                                stats["tasks_completed"] += 1
+                                logger.warning("expired_task_submitted", task_id=tid)
+                            else:
+                                stats["tasks_failed"] += 1
+                                logger.warning("expired_task_submit_failed", task_id=tid)
                         task_holder._check_counter = 0
                     await asyncio.sleep(0.05)
                     continue
@@ -185,6 +189,21 @@ async def main_loop() -> None:
         workers = [asyncio.create_task(inference_worker(i)) for i in range(num_workers)]
         logger.info("workers_started", num_workers=num_workers)
 
+        async def _drain_and_submit(max_count: int):
+            drained = await task_holder.peek_drain(max_count)
+            if not drained:
+                return
+            logger.info("holder_drain_start", count=len(drained))
+            for task, _, bucket in drained:
+                tid = task.get("overview", {}).get("task_id")
+                success = await process_task(client, task, backoff, task.get("overview", {}).get("target_sla"))
+                if success:
+                    stats["tasks_completed"] += 1
+                    logger.debug("drained_task_submitted", task_id=tid, bucket=bucket)
+                else:
+                    stats["tasks_failed"] += 1
+                    logger.warning("drained_task_submit_failed", task_id=tid, bucket=bucket)
+
         async def prefetch_tasks():
             holder_stats = await task_holder.get_stats()
             fill_ratio = holder_stats["held"] / max(holder_stats["max"], 1)
@@ -223,29 +242,27 @@ async def main_loop() -> None:
                 if not estimate_task_feasible(temp_task, target_sla):
                     remaining = (deadline_ms / 1000.0) if deadline_ms else float("inf")
                     est_duration = estimate_task_feasible.__wrapped__(temp_task, target_sla, 1.0) if hasattr(estimate_task_feasible, "__wrapped__") else 0.5
-                    logger.info(
+                    logger.debug(
                         "task_rejected_predicted_timeout",
                         task_id=task_id,
                         remaining=remaining,
                         reward=target_reward,
                     )
-                    # metrics.inc_counter("client.tasks.rejected_timeout_predicted")
-                    await reject_task(client, task_id, backoff, reason="timeout_predicted")
                     continue
 
                 task = await accept_task(client, task_id, target_sla, backoff)
                 if task is None:
-                    # 竞争失败：任务从 queried 集合移除，需要显式 reject 让 matcher 释放
-                    await reject_task(client, task_id, backoff, reason="accept_failed")
                     continue
 
-                if await task_holder.add_task(task):
+                if not await task_holder.add_task(task):
+                    await _drain_and_submit(max_count=4)
+                    if not await task_holder.add_task(task):
+                        await _drain_and_submit(max_count=task_holder.max_held)
+                        await task_holder.add_task(task)
+                    prefetched += 1
+                else:
                     prefetched += 1
                     logger.debug("task_prefetched", task_id=task_id)
-                else:
-                    # 任务已被接受(inflight)，但 holder 满了，需要拒绝它让 matcher 重新分配
-                    await reject_task(client, task_id, backoff, reason="holder_full")
-                    break
 
             return prefetched
 

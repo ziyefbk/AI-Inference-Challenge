@@ -190,6 +190,18 @@ class PriorityTaskHolder:
         async with self._lock:
             return len(self._short_heap) + len(self._long_heap) < self.max_held
 
+    async def peek_drain(self, max_count: int) -> List[tuple]:
+        """临时取出最多 max_count 个任务用于强制提交，腾出 holder 容量。"""
+        drained = []
+        async with self._lock:
+            for heap in (self._short_heap, self._long_heap):
+                while len(drained) < max_count and heap:
+                    priority, counter, accept_time, task, bucket = heapq.heappop(heap)
+                    task_id = task.get("overview", {}).get("task_id", counter)
+                    self._task_map.pop(task_id, None)
+                    drained.append((task, accept_time, bucket))
+        return drained
+
     async def get_stats(self) -> Dict[str, Any]:
         async with self._lock:
             now = time.monotonic()
