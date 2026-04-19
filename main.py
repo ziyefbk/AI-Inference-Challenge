@@ -149,7 +149,7 @@ def _build_vllm_cmd(python_bin: str, model_path: str, port: int, tp_size: int, i
         "--model", model_path,
         "--port", str(port),
         "--gpu-memory-utilization", "0.75",
-        "--tensor-parallel-size", str(tp_size),
+        "--tensor-parallel-size", "4",
         "--enable-prefix-caching",
         "--disable-log-stats",
         "--disable-uvicorn-access-log",
